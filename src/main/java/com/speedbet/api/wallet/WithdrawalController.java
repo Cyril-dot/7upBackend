@@ -1,0 +1,200 @@
+package com.speedbet.api.wallet;
+
+import com.speedbet.api.audit.AuditService;
+import com.speedbet.api.common.ApiException;
+import com.speedbet.api.common.ApiResponse;
+import com.speedbet.api.kyc.KycService;
+import com.speedbet.api.user.User;
+import com.speedbet.api.user.UserRole;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/wallet/withdrawals")
+@RequiredArgsConstructor
+public class WithdrawalController {
+
+    private final WithdrawalService withdrawalService;
+    private final AuditService auditService;
+    private final KycService kycService;
+    private final com.speedbet.api.user.HierarchyService hierarchy;
+
+    private boolean isOwner(User user) {
+        return user != null && user.getRole() == UserRole.SITE_OWNER;
+    }
+
+    private boolean isSuperAdmin(User user) {
+        return user != null && user.getRole() == UserRole.SUPER_ADMIN;
+    }
+
+    /** SA callers see only their subtree; owner/admin callers see everything (admin behavior unchanged). */
+    private java.util.Collection<java.util.UUID> scopeFor(User user) {
+        if (isSuperAdmin(user)) return hierarchy.visibleUserIds(user.getId());
+        return null;
+    }
+
+    private void requireWithdrawalVisible(User user, UUID withdrawalId) {
+        if (!isSuperAdmin(user)) return;
+        var dto = withdrawalService.getById(withdrawalId);
+        if (dto.getUserId() == null || !hierarchy.isUserVisibleTo(user.getId(), dto.getUserId())) {
+            throw ApiException.forbidden("Withdrawal does not belong to your branch");
+        }
+    }
+
+    // ==================== USER ENDPOINTS ====================
+
+    @PostMapping
+    public ResponseEntity<ApiResponse<WithdrawalDto>> submitWithdrawal(
+            @Valid @RequestBody WithdrawalRequestDto req,
+            @AuthenticationPrincipal User user) {
+        // Strong KYC enforcement (server-side, not just the UI gate):
+        // a player (role USER) may only request a withdrawal when their
+        // latest KYC submission is APPROVED. Staff are exempt — they are
+        // the operators who review withdrawals and KYC.
+        if (kycService.isEnforcementEnabled() && user.getRole() == UserRole.USER && !kycService.isVerified(user.getId())) {
+            throw ApiException.forbidden(
+                    "KYC verification is required before you can withdraw. "
+                    + "Complete your identity verification (KYC) first.");
+        }
+        WithdrawalDto request = withdrawalService.submitRequest(user.getId(), req);
+        return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal request submitted"));
+    }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<Page<WithdrawalDto>>> getMyWithdrawals(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size,
+            @RequestParam(required = false) WithdrawalStatus status,
+            @AuthenticationPrincipal User user) {
+        Pageable pageable = PageRequest.of(page, size,
+                Sort.by(Sort.Direction.DESC, "createdAt"));
+        Page<WithdrawalDto> withdrawals = withdrawalService.getUserWithdrawals(user.getId(), pageable);
+        return ResponseEntity.ok(ApiResponse.ok(withdrawals));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<WithdrawalDto>> getWithdrawal(
+            @PathVariable UUID id,
+            @AuthenticationPrincipal User user) {
+        WithdrawalDto request = withdrawalService.getByIdAndUser(id, user.getId());
+        return ResponseEntity.ok(ApiResponse.ok(request));
+    }
+
+    // ==================== ADMIN ENDPOINTS ====================
+
+    @GetMapping("/admin/all")
+    public ResponseEntity<ApiResponse<Page<WithdrawalDto>>> getAllWithdrawalsForAdmin(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size,
+            @RequestParam(required = false) WithdrawalStatus status,
+            @AuthenticationPrincipal User user) {
+        if (user.getRole() != UserRole.ADMIN && user.getRole() != UserRole.SUPER_ADMIN
+                && user.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Admin access required");
+        }
+        Pageable pageable = PageRequest.of(page, size,
+                Sort.by(Sort.Direction.DESC, "createdAt"));
+        var scope = scopeFor(user);
+        Page<WithdrawalDto> withdrawals = scope == null
+                ? withdrawalService.getAllWithdrawals(status, pageable)
+                : withdrawalService.getAllWithdrawals(status, pageable, scope);
+        return ResponseEntity.ok(ApiResponse.ok(withdrawals));
+    }
+
+    @GetMapping("/admin/stats")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getAdminStats(
+            @AuthenticationPrincipal User user) {
+        if (user.getRole() != UserRole.ADMIN && user.getRole() != UserRole.SUPER_ADMIN
+                && user.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Admin access required");
+        }
+        var scope = scopeFor(user);
+        var stats = scope == null
+                ? withdrawalService.getAdminStats()
+                : withdrawalService.getAdminStats(scope);
+        return ResponseEntity.ok(ApiResponse.ok(stats));
+    }
+
+    @PostMapping("/admin/{id}/approve")
+    public ResponseEntity<ApiResponse<WithdrawalDto>> approveWithdrawal(
+            @PathVariable UUID id,
+            @RequestBody Map<String, String> req,
+            @AuthenticationPrincipal User user) {
+        if (user.getRole() != UserRole.ADMIN && user.getRole() != UserRole.SUPER_ADMIN
+                && user.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Admin access required");
+        }
+        requireWithdrawalVisible(user, id);
+        var note = req.getOrDefault("note", "");
+        WithdrawalDto request = withdrawalService.approve(id, user.getId(), note);
+        return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal approved"));
+    }
+
+    @PostMapping("/admin/{id}/reject")
+    public ResponseEntity<ApiResponse<WithdrawalDto>> rejectWithdrawal(
+            @PathVariable UUID id,
+            @RequestBody Map<String, String> req,
+            @AuthenticationPrincipal User user) {
+        if (user.getRole() != UserRole.ADMIN && user.getRole() != UserRole.SUPER_ADMIN
+                && user.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Admin access required");
+        }
+        requireWithdrawalVisible(user, id);
+        var note = req.getOrDefault("note", "");
+        WithdrawalDto request = withdrawalService.reject(id, user.getId(), note);
+        return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal rejected"));
+    }
+
+    // ==================== SUPER ADMIN ENDPOINTS ====================
+
+    @PostMapping("/super-admin/{id}/settle")
+    public ResponseEntity<ApiResponse<WithdrawalDto>> settleWithdrawal(
+            @PathVariable UUID id,
+            @RequestBody Map<String, String> req,
+            @AuthenticationPrincipal User user) {
+        if (user.getRole() != UserRole.SUPER_ADMIN && user.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Super admin access required");
+        }
+        requireWithdrawalVisible(user, id);
+        var note = req.getOrDefault("note", "");
+        WithdrawalDto request = withdrawalService.settle(id, user.getId(), note);
+        return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal settled"));
+    }
+
+    @PostMapping("/super-admin/{id}/mark-failed")
+    public ResponseEntity<ApiResponse<WithdrawalDto>> markWithdrawalFailed(
+            @PathVariable UUID id,
+            @RequestBody Map<String, String> req,
+            @AuthenticationPrincipal User user) {
+        if (user.getRole() != UserRole.SUPER_ADMIN && user.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Super admin access required");
+        }
+        requireWithdrawalVisible(user, id);
+        var note = req.getOrDefault("note", "");
+        WithdrawalDto request = withdrawalService.markFailed(id, user.getId(), note);
+        return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal marked as failed"));
+    }
+
+    @GetMapping("/super-admin/stats")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getSuperAdminStats(
+            @AuthenticationPrincipal User user) {
+        if (user.getRole() != UserRole.SUPER_ADMIN && user.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Super admin access required");
+        }
+        var scope = scopeFor(user);
+        var stats = scope == null
+                ? withdrawalService.getSuperAdminStats()
+                : withdrawalService.getSuperAdminStats(scope);
+        return ResponseEntity.ok(ApiResponse.ok(stats));
+    }
+}

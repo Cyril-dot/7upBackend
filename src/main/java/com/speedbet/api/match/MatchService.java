@@ -1,0 +1,1436 @@
+package com.speedbet.api.match;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.speedbet.api.ai.MistralClient;
+import com.speedbet.api.common.ApiException;
+import com.speedbet.api.odds.Odds;
+import com.speedbet.api.odds.OddsRepository;
+import com.speedbet.api.sportsdata.CompetitionIds;
+import com.speedbet.api.sportsdata.EspnFootballDataService;
+import com.speedbet.api.sportsdata.Top6LeagueTeams;
+import com.speedbet.api.sportsdata.odds.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class MatchService {
+
+    private final MatchRepository             matchRepo;
+    private final OddsRepository              oddsRepo;
+    private final MistralClient               mistralClient;
+    private final EspnFootballDataService     espnFootballDataService;
+    private final CacheManager                cacheManager;
+
+    // ── Odds generators ───────────────────────────────────────────────────
+    private final OddsGeneratorService        oddsGeneratorService;
+    private final LiveOddsGeneratorService    liveOddsGeneratorService;
+    private final CorrectScoreOddsService     correctScoreOddsService;
+    private final HalfTimeOddsService         halfTimeOddsService;
+    private final HandicapOddsService         handicapOddsService;
+
+    // ── Odds persistence (guarantees every saved game has odds in the DB) ─
+    private final OddsPersistenceService      oddsPersistenceService;
+
+    // ── Live odds TTL ─────────────────────────────────────────────────────
+    private static final long LIVE_ODDS_TTL_MS      = 2 * 60_000L;
+    private static final int  LIVE_ODDS_MAX_ENTRIES  = 100;
+    private static final int  PRE_MATCH_MAX_ENTRIES  = 500;
+    private static final int  PRE_MATCH_TTL_MINUTES  = 60;
+
+    // ── Max matches to process in withOdds/withAllOdds ────────────────────
+    // NOTE: matches beyond this cap are NOT returned. Raise it (or remove the
+    // .limit(...) calls) if you want no game dropped from bundled responses.
+    private static final int  MAX_ODDS_BUNDLE_SIZE   = 100;
+
+    // ── Live odds caches (Caffeine — bounded + TTL) ───────────────────────
+    private final Cache<UUID, OddsCacheEntry> liveOddsCache =
+            Caffeine.newBuilder()
+                    .maximumSize(LIVE_ODDS_MAX_ENTRIES)
+                    .expireAfterWrite(LIVE_ODDS_TTL_MS * 2, TimeUnit.MILLISECONDS)
+                    .build();
+
+    private final Cache<UUID, OddsCacheEntry> liveHandicapCache =
+            Caffeine.newBuilder()
+                    .maximumSize(LIVE_ODDS_MAX_ENTRIES)
+                    .expireAfterWrite(LIVE_ODDS_TTL_MS * 2, TimeUnit.MILLISECONDS)
+                    .build();
+
+    // ── Pre-match odds caches (Caffeine — bounded + TTL) ─────────────────
+    private final Cache<UUID, List<Map<String, Object>>> preMatchOddsCache =
+            Caffeine.newBuilder()
+                    .maximumSize(PRE_MATCH_MAX_ENTRIES)
+                    .expireAfterWrite(PRE_MATCH_TTL_MINUTES, TimeUnit.MINUTES)
+                    .build();
+
+    private final Cache<UUID, List<Map<String, Object>>> preMatchHandicapCache =
+            Caffeine.newBuilder()
+                    .maximumSize(PRE_MATCH_MAX_ENTRIES)
+                    .expireAfterWrite(PRE_MATCH_TTL_MINUTES, TimeUnit.MINUTES)
+                    .build();
+
+    // ── warnedDemotions: bounded Caffeine cache (prevents unbounded growth) ──
+    private final Cache<String, Boolean> warnedDemotions =
+            Caffeine.newBuilder()
+                    .maximumSize(500)
+                    .expireAfterWrite(15, TimeUnit.MINUTES)
+                    .build();
+
+    private record OddsCacheEntry(List<Map<String, Object>> odds, long expiresAt) {
+        boolean isValid() { return System.currentTimeMillis() <= expiresAt; }
+    }
+
+    // ── Status transition guard ───────────────────────────────────────────
+    private static boolean isPermittedTransition(String existing, String incoming) {
+        if (existing == null || existing.equals(incoming)) return true;
+        return switch (existing) {
+            case "FINISHED" -> false;
+            case "LIVE"     -> "FINISHED".equals(incoming);
+            default         -> true;
+        };
+    }
+
+    // ── Pre-built display-name sets ───────────────────────────────────────
+    private static final Set<String> CUP_NAMES =
+            Arrays.stream(CompetitionIds.CupCompetition.values())
+                    .map(CompetitionIds.CupCompetition::displayName)
+                    .collect(Collectors.toUnmodifiableSet());
+
+    private static final Set<String> TOP6_CUP_NAMES =
+            Arrays.stream(CompetitionIds.CupCompetition.top6Related())
+                    .map(CompetitionIds.CupCompetition::displayName)
+                    .collect(Collectors.toUnmodifiableSet());
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+    private static boolean isMissing(String val) {
+        return val == null || val.isBlank();
+    }
+
+    private static boolean isRealKickoff(Instant t) {
+        return t != null && t.getNano() == 0;
+    }
+
+    private static boolean hasLogos(Match m) {
+        return !isMissing(m.getHomeLogo()) && !isMissing(m.getAwayLogo());
+    }
+
+    private static final Comparator<Match> LOGO_THEN_KICKOFF =
+            Comparator.comparingInt((Match m) -> hasLogos(m) ? 0 : 1)
+                    .thenComparing(m -> m.getKickoffAt() != null ? m.getKickoffAt() : Instant.MAX);
+
+    private static boolean leagueIn(Match m, Set<String> names) {
+        if (m.getLeague() == null) return false;
+        return names.stream().anyMatch(n -> n.equalsIgnoreCase(m.getLeague()));
+    }
+
+    private UUID toUuid(String id) {
+        try { return UUID.fromString(id); }
+        catch (IllegalArgumentException e) { throw ApiException.notFound("Match not found: " + id); }
+    }
+
+    // ── isToday helper for smart cache eviction ───────────────────────────
+    private static boolean isToday(Match match) {
+        if (match.getKickoffAt() == null) return false;
+        LocalDate today    = LocalDate.now(ZoneOffset.UTC);
+        LocalDate matchDay = match.getKickoffAt().atZone(ZoneOffset.UTC).toLocalDate();
+        return today.equals(matchDay);
+    }
+
+    // ── Safe cache clear helper ───────────────────────────────────────────
+    private void clearCache(String name) {
+        org.springframework.cache.Cache c = cacheManager.getCache(name);
+        if (c != null) c.clear();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // NEVER-EMPTY ODDS HELPERS
+    // Every match, whatever its status, must always get odds.
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** Returns the list if non-empty, otherwise the fallback. */
+    private static List<Map<String, Object>> orElseGenerate(
+            List<Map<String, Object>> value,
+            Supplier<List<Map<String, Object>>> fallback) {
+        return (value != null && !value.isEmpty()) ? value : fallback.get();
+    }
+
+    /** Pre-match 1X2 — cached, never empty (generator itself is null-safe). */
+    private List<Map<String, Object>> preMatch1X2(Match match) {
+        return preMatchOddsCache.get(match.getId(), id -> orElseGenerate(
+                null,
+                () -> oddsGeneratorService.generatePreMatchOdds(
+                        match.getHomeTeam(), match.getAwayTeam(), match.getLeague())));
+    }
+
+    /** Pre-match handicap — cached, exceptions never propagate. */
+    private List<Map<String, Object>> preMatchHandicap(Match match) {
+        return preMatchHandicapCache.get(match.getId(), id -> {
+            List<Map<String, Object>> h = null;
+            try {
+                h = handicapOddsService.generateHandicapOdds(
+                        match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+            } catch (Exception e) {
+                log.warn("preMatchHandicap: matchId={} failed — {}", match.getId(), e.getMessage());
+            }
+            return h != null ? h : List.of();
+        });
+    }
+
+    /**
+     * Live 1X2 that is never empty: cache → live generator → pre-match generator.
+     * An empty result is never cached.
+     */
+    private List<Map<String, Object>> live1X2(Match match) {
+        OddsCacheEntry cached = liveOddsCache.getIfPresent(match.getId());
+        if (cached != null && cached.isValid() && !cached.odds().isEmpty()) return cached.odds();
+
+        int scoreHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
+        int scoreAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
+        int minute    = extractMinute(match);
+
+        List<Map<String, Object>> live = null;
+        try {
+            live = liveOddsGeneratorService.generateLiveOdds(
+                    match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
+        } catch (Exception e) {
+            log.warn("live1X2: matchId={} live generator failed — {}", match.getId(), e.getMessage());
+        }
+        if (live != null && !live.isEmpty()) {
+            cacheLiveOdds(match.getId(), live);
+            return live;
+        }
+        // Fall back to pre-match odds (deliberately not cached as live)
+        return oddsGeneratorService.generatePreMatchOdds(
+                match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+    }
+
+    /** Live handicap — never cached empty, falls back to pre-match handicap. */
+    private List<Map<String, Object>> liveHandicap(Match match) {
+        OddsCacheEntry cached = liveHandicapCache.getIfPresent(match.getId());
+        if (cached != null && cached.isValid() && !cached.odds().isEmpty()) return cached.odds();
+
+        int scoreHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
+        int scoreAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
+        int minute    = extractMinute(match);
+
+        List<Map<String, Object>> live = null;
+        try {
+            live = handicapOddsService.generateLiveHandicapOdds(
+                    match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
+        } catch (Exception e) {
+            log.warn("liveHandicap: matchId={} live generator failed — {}", match.getId(), e.getMessage());
+        }
+        if (live != null && !live.isEmpty()) {
+            cacheLiveHandicapOdds(match.getId(), live);
+            return live;
+        }
+        List<Map<String, Object>> fallback = handicapOddsService.generateHandicapOdds(
+                match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+        return fallback != null ? fallback : List.of();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // LIVE ODDS CACHE HELPERS
+    // ══════════════════════════════════════════════════════════════════════
+
+    public boolean isOddsCacheValid(UUID matchId) {
+        OddsCacheEntry entry = liveOddsCache.getIfPresent(matchId);
+        return entry != null && entry.isValid();
+    }
+
+    public void cacheLiveOdds(UUID matchId, List<Map<String, Object>> odds) {
+        long expires = System.currentTimeMillis() + LIVE_ODDS_TTL_MS;
+        liveOddsCache.put(matchId, new OddsCacheEntry(odds, expires));
+        log.debug("cacheLiveOdds: cached 1X2 odds for matchId={} expires in {}ms", matchId, LIVE_ODDS_TTL_MS);
+    }
+
+    public boolean isHandicapCacheValid(UUID matchId) {
+        OddsCacheEntry entry = liveHandicapCache.getIfPresent(matchId);
+        return entry != null && entry.isValid();
+    }
+
+    public void cacheLiveHandicapOdds(UUID matchId, List<Map<String, Object>> odds) {
+        long expires = System.currentTimeMillis() + LIVE_ODDS_TTL_MS;
+        liveHandicapCache.put(matchId, new OddsCacheEntry(odds, expires));
+        log.debug("cacheLiveHandicapOdds: cached handicap odds for matchId={} expires in {}ms", matchId, LIVE_ODDS_TTL_MS);
+    }
+
+    public List<Map<String, Object>> getOddsFromCache(UUID matchId, String market) {
+        return switch (market) {
+            case "1X2" -> {
+                OddsCacheEntry entry = liveOddsCache.getIfPresent(matchId);
+                yield (entry != null && entry.isValid()) ? entry.odds() : null;
+            }
+            case "asian_handicap" -> {
+                OddsCacheEntry entry = liveHandicapCache.getIfPresent(matchId);
+                yield (entry != null && entry.isValid()) ? entry.odds() : null;
+            }
+            default -> {
+                log.debug("getOddsFromCache: no cache for market='{}' matchId={}", market, matchId);
+                yield null;
+            }
+        };
+    }
+
+    public void evictPreMatchCache(UUID matchId) {
+        preMatchOddsCache.invalidate(matchId);
+        preMatchHandicapCache.invalidate(matchId);
+        log.debug("evictPreMatchCache: evicted matchId={}", matchId);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // BASIC QUERIES
+    // ══════════════════════════════════════════════════════════════════════
+
+    public List<Match> getLiveMatches() {
+        return getAllLeaguesLiveMatches();
+    }
+
+    public List<Match> getLiveMatches(String sport) {
+        return getAllLeaguesLiveMatches(sport);
+    }
+
+    public List<Match> getUpcomingMatches() {
+        return getAllLeaguesUpcomingMatches();
+    }
+
+    @Cacheable("todayMatches")
+    public List<Match> getTodayMatches() {
+        return getAllLeaguesTodayMatches();
+    }
+
+    public List<Match> getFutureMatches() {
+        return getAllLeaguesFutureMatches();
+    }
+
+    public List<Match> getRecentResults() {
+        return getRecentResultsLimited(20);
+    }
+
+    // FIX: uses DB-level Pageable limit instead of loading all then stream-limiting.
+    // FIX: uses new findRecentFinishedBySportAndStatus() JPQL query added to MatchRepository.
+    public List<Match> getRecentResultsLimited(int limit) {
+        Instant cutoff = Instant.now().minus(72, ChronoUnit.HOURS);
+        List<Match> matches = matchRepo
+                .findRecentFinishedBySportAndStatus(
+                        "football", "FINISHED", cutoff,
+                        PageRequest.of(0, Math.max(limit, 50)))
+                .stream()
+                .limit(limit)
+                .toList();
+        log.info("getRecentResults: returning {} FINISHED football match(es) (72h window, cap={})",
+                matches.size(), limit);
+        return matches;
+    }
+
+    @Cacheable("featuredMatches")
+    public List<Match> getFeaturedMatches() {
+        List<Match> matches = matchRepo.findByFeaturedTrueOrderByKickoffAt().stream()
+                .filter(m -> "football".equalsIgnoreCase(m.getSport()))
+                // Featured is a betting surface: a match that is over (or will
+                // not be played) must drop off it. The featured flag itself is
+                // never cleared on settlement, so without this filter a
+                // FINISHED match stayed featured indefinitely (observed live
+                // 2026-10-05: Kestrel Park FC vs Juniper Vale, settled
+                // 12:15 UTC, still returned by this endpoint at 18:23 UTC).
+                .filter(m -> !MatchStatus.FINISHED.equalsIgnoreCase(m.getStatus())
+                        && !MatchStatus.CANCELLED.equalsIgnoreCase(m.getStatus())
+                        && !MatchStatus.POSTPONED.equalsIgnoreCase(m.getStatus()))
+                .limit(50)
+                .toList();
+        log.info("getFeaturedMatches: {} featured football match(es)", matches.size());
+        return matches;
+    }
+
+    public Match getById(String id) {
+        return matchRepo.findById(toUuid(id))
+                .orElseThrow(() -> ApiException.notFound("Match not found: " + id));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ALL LEAGUES — DB queries (source of truth)
+    // ══════════════════════════════════════════════════════════════════════
+
+    public List<Match> getAllLeaguesLiveMatches() {
+        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE")
+                .stream().limit(100).toList();
+        log.info("getAllLeaguesLiveMatches: {} LIVE football match(es) across all leagues", matches.size());
+        return matches;
+    }
+
+    public List<Match> getAllLeaguesLiveMatches(String sport) {
+        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt(sport, "LIVE")
+                .stream().limit(100).toList();
+        log.info("getAllLeaguesLiveMatches(sport='{}'): {} LIVE match(es) across all leagues", sport, matches.size());
+        return matches;
+    }
+
+    public List<Match> getAllLeaguesUpcomingMatches() {
+        Instant now = Instant.now();
+        List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS))
+                .stream()
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
+                .toList();
+        int withLogos    = (int) matches.stream().filter(MatchService::hasLogos).count();
+        int withoutLogos = matches.size() - withLogos;
+        log.info("getAllLeaguesUpcomingMatches: {} upcoming football match(es) — {} with logos, {} without",
+                matches.size(), withLogos, withoutLogos);
+        return matches;
+    }
+
+    public List<Match> getAllLeaguesTodayMatches() {
+        Instant startOfDay = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
+        Instant endOfDay   = startOfDay.plus(1, ChronoUnit.DAYS);
+        List<Match> matches = matchRepo.findByKickoffBetweenAndSport("football", startOfDay, endOfDay)
+                .stream().limit(200).toList();
+        log.info("getAllLeaguesTodayMatches: {} football match(es) today across all leagues", matches.size());
+        return matches;
+    }
+
+    public List<Match> getAllLeaguesFutureMatches() {
+        Instant now = Instant.now();
+        List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS))
+                .stream()
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
+                .toList();
+        int withLogos    = (int) matches.stream().filter(MatchService::hasLogos).count();
+        int withoutLogos = matches.size() - withLogos;
+        log.info("getAllLeaguesFutureMatches: {} football match(es) next 7 days — {} with logos, {} without",
+                matches.size(), withLogos, withoutLogos);
+        return matches;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // TOP-6 LEAGUES — DB queries
+    // ══════════════════════════════════════════════════════════════════════
+
+    public List<Match> getTop6LiveMatches() {
+        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE").stream()
+                .filter(Top6LeagueTeams::isKnownTop6Match)
+                .limit(100)
+                .toList();
+        log.info("getTop6LiveMatches: {} LIVE football match(es) in top-6 leagues (team-validated)", matches.size());
+        return matches;
+    }
+
+    public List<Match> getTop6UpcomingMatches() {
+        Instant now = Instant.now();
+        List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS)).stream()
+                .filter(Top6LeagueTeams::isKnownTop6Match)
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
+                .toList();
+        log.info("getTop6UpcomingMatches: {} upcoming football match(es) in top-6 leagues (team-validated)", matches.size());
+        return matches;
+    }
+
+    public List<Match> getTop6TodayMatches() {
+        Instant startOfDay = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
+        Instant endOfDay   = startOfDay.plus(1, ChronoUnit.DAYS);
+        List<Match> matches = matchRepo.findByKickoffBetweenAndSport("football", startOfDay, endOfDay).stream()
+                .filter(Top6LeagueTeams::isKnownTop6Match)
+                .limit(100)
+                .toList();
+        log.info("getTop6TodayMatches: {} football match(es) today in top-6 leagues (team-validated)", matches.size());
+        return matches;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // TOP-6 CUPS — DB queries
+    // ══════════════════════════════════════════════════════════════════════
+
+    public List<Match> getTop6CupsLiveMatches() {
+        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE").stream()
+                .filter(m -> leagueIn(m, TOP6_CUP_NAMES))
+                .limit(100)
+                .toList();
+        log.info("getTop6CupsLiveMatches: {} LIVE football cup match(es)", matches.size());
+        return matches;
+    }
+
+    public List<Match> getTop6CupsUpcomingMatches() {
+        Instant now = Instant.now();
+        List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS)).stream()
+                .filter(m -> leagueIn(m, TOP6_CUP_NAMES))
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
+                .toList();
+        log.info("getTop6CupsUpcomingMatches: {} upcoming football cup match(es)", matches.size());
+        return matches;
+    }
+
+    public List<Match> getTop6CupsTodayMatches() {
+        Instant startOfDay = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
+        Instant endOfDay   = startOfDay.plus(1, ChronoUnit.DAYS);
+        List<Match> matches = matchRepo.findByKickoffBetweenAndSport("football", startOfDay, endOfDay).stream()
+                .filter(m -> leagueIn(m, TOP6_CUP_NAMES))
+                .limit(100)
+                .toList();
+        log.info("getTop6CupsTodayMatches: {} football cup match(es) today", matches.size());
+        return matches;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ALL CUPS — DB queries
+    // ══════════════════════════════════════════════════════════════════════
+
+    public List<Match> getAllCupsLiveMatches() {
+        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE").stream()
+                .filter(m -> leagueIn(m, CUP_NAMES))
+                .limit(100)
+                .toList();
+        log.info("getAllCupsLiveMatches: {} LIVE football cup match(es) (all cups)", matches.size());
+        return matches;
+    }
+
+    public List<Match> getAllCupsUpcomingMatches() {
+        Instant now = Instant.now();
+        List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS)).stream()
+                .filter(m -> leagueIn(m, CUP_NAMES))
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
+                .toList();
+        log.info("getAllCupsUpcomingMatches: {} upcoming football cup match(es) (all cups)", matches.size());
+        return matches;
+    }
+
+    public List<Match> getAllCupsTodayMatches() {
+        Instant startOfDay = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
+        Instant endOfDay   = startOfDay.plus(1, ChronoUnit.DAYS);
+        List<Match> matches = matchRepo.findByKickoffBetweenAndSport("football", startOfDay, endOfDay).stream()
+                .filter(m -> leagueIn(m, CUP_NAMES))
+                .limit(100)
+                .toList();
+        log.info("getAllCupsTodayMatches: {} football cup match(es) today (all cups)", matches.size());
+        return matches;
+    }
+
+    // ── EspnLeague overloads ──────────────────────────────────────────────
+
+    public List<Match> getLiveMatchesByLeagueEnum(EspnFootballDataService.EspnLeague league) {
+        return getLiveMatchesByLeague(league.displayName());
+    }
+
+    public List<Match> getTodayMatchesByLeagueEnum(EspnFootballDataService.EspnLeague league) {
+        return getTodayMatchesByLeague(league.displayName());
+    }
+
+    public List<Match> getUpcomingMatchesByLeagueEnum(EspnFootballDataService.EspnLeague league) {
+        return getUpcomingMatchesByLeague(league.displayName());
+    }
+
+    // ── EspnCup overloads ─────────────────────────────────────────────────
+
+    public List<Match> getLiveMatchesByCupEnum(EspnFootballDataService.EspnCup cup) {
+        return getLiveMatchesByLeague(cup.displayName());
+    }
+
+    public List<Match> getTodayMatchesByCupEnum(EspnFootballDataService.EspnCup cup) {
+        return getTodayMatchesByLeague(cup.displayName());
+    }
+
+    public List<Match> getUpcomingMatchesByCupEnum(EspnFootballDataService.EspnCup cup) {
+        return getUpcomingMatchesByLeague(cup.displayName());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // BY-LEAGUE QUERIES
+    // ══════════════════════════════════════════════════════════════════════
+
+    public List<Match> getLiveMatchesByLeague(String leagueName) {
+        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE").stream()
+                .filter(m -> leagueName.equalsIgnoreCase(m.getLeague()))
+                .filter(m -> isTop6LeagueValidatedOrPassThrough(m, leagueName))
+                .limit(100)
+                .toList();
+        log.info("getLiveMatchesByLeague: {} LIVE football match(es) for league='{}'", matches.size(), leagueName);
+        return matches;
+    }
+
+    public List<Match> getUpcomingMatchesByLeague(String leagueName) {
+        Instant now = Instant.now();
+        List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS)).stream()
+                .filter(m -> leagueName.equalsIgnoreCase(m.getLeague()))
+                .filter(m -> isTop6LeagueValidatedOrPassThrough(m, leagueName))
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
+                .toList();
+        log.info("getUpcomingMatchesByLeague: {} upcoming football match(es) for league='{}'", matches.size(), leagueName);
+        return matches;
+    }
+
+    public List<Match> getTodayMatchesByLeague(String leagueName) {
+        Instant startOfDay = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
+        Instant endOfDay   = startOfDay.plus(1, ChronoUnit.DAYS);
+        List<Match> matches = matchRepo.findByKickoffBetweenAndSport("football", startOfDay, endOfDay).stream()
+                .filter(m -> leagueName.equalsIgnoreCase(m.getLeague()))
+                .filter(m -> isTop6LeagueValidatedOrPassThrough(m, leagueName))
+                .limit(100)
+                .toList();
+        log.info("getTodayMatchesByLeague: {} football match(es) today for league='{}'", matches.size(), leagueName);
+        return matches;
+    }
+
+    private boolean isTop6LeagueValidatedOrPassThrough(Match m, String leagueName) {
+        return Top6LeagueTeams.fromLeagueName(leagueName)
+                .map(t -> t.isValidMatch(m))
+                .orElse(true);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // BY-TEAM QUERIES
+    // ══════════════════════════════════════════════════════════════════════
+
+    public List<Match> getLiveMatchesByTeamName(String teamName) {
+        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE").stream()
+                .filter(m -> teamName.equalsIgnoreCase(m.getHomeTeam())
+                        || teamName.equalsIgnoreCase(m.getAwayTeam()))
+                .limit(50)
+                .toList();
+        log.info("getLiveMatchesByTeamName: {} LIVE football match(es) for team='{}'", matches.size(), teamName);
+        return matches;
+    }
+
+    public List<Match> getUpcomingMatchesByTeamName(String teamName) {
+        Instant now = Instant.now();
+        List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS)).stream()
+                .filter(m -> teamName.equalsIgnoreCase(m.getHomeTeam())
+                        || teamName.equalsIgnoreCase(m.getAwayTeam()))
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(50)
+                .toList();
+        log.info("getUpcomingMatchesByTeamName: {} upcoming football match(es) for team='{}'", matches.size(), teamName);
+        return matches;
+    }
+
+    public List<Match> getRecentResultsByTeamName(String teamName) {
+        Instant cutoff = Instant.now().minus(72, ChronoUnit.HOURS);
+        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "FINISHED").stream()
+                .filter(m -> m.getKickoffAt() != null && m.getKickoffAt().isAfter(cutoff))
+                .filter(m -> teamName.equalsIgnoreCase(m.getHomeTeam())
+                        || teamName.equalsIgnoreCase(m.getAwayTeam()))
+                .limit(20)
+                .toList();
+        log.info("getRecentResultsByTeamName: {} recent football result(s) for team='{}'", matches.size(), teamName);
+        return matches;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // LIST + ODDS BUNDLES
+    // Every match in the bundle ALWAYS gets odds, regardless of status.
+    // ══════════════════════════════════════════════════════════════════════
+
+    public List<Map<String, Object>> withOdds(List<Match> matches) {
+        if (matches.isEmpty()) return Collections.emptyList();
+        List<Match> sorted = matches.stream()
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(MAX_ODDS_BUNDLE_SIZE)
+                .toList();
+        if (matches.size() > MAX_ODDS_BUNDLE_SIZE) {
+            log.warn("withOdds: input has {} matches but cap is {} — {} match(es) NOT returned",
+                    matches.size(), MAX_ODDS_BUNDLE_SIZE, matches.size() - MAX_ODDS_BUNDLE_SIZE);
+        }
+        log.debug("withOdds: bundling odds for {} match(es) (input={}, cap={})",
+                sorted.size(), matches.size(), MAX_ODDS_BUNDLE_SIZE);
+        List<Map<String, Object>> out = new ArrayList<>(sorted.size());
+        for (Match match : sorted) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("match", match);
+            entry.put("odds", "LIVE".equals(match.getStatus()) ? live1X2(match) : preMatch1X2(match));
+            out.add(entry);
+        }
+        log.debug("withOdds: bundled {} entries", out.size());
+        return out;
+    }
+
+    public List<Map<String, Object>> withAllOdds(List<Match> matches) {
+        if (matches.isEmpty()) return Collections.emptyList();
+        List<Match> sorted = matches.stream()
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(MAX_ODDS_BUNDLE_SIZE)
+                .toList();
+        if (matches.size() > MAX_ODDS_BUNDLE_SIZE) {
+            log.warn("withAllOdds: input has {} matches but cap is {} — {} match(es) NOT returned",
+                    matches.size(), MAX_ODDS_BUNDLE_SIZE, matches.size() - MAX_ODDS_BUNDLE_SIZE);
+        }
+        log.debug("withAllOdds: bundling all markets for {} match(es) (input={}, cap={})",
+                sorted.size(), matches.size(), MAX_ODDS_BUNDLE_SIZE);
+        List<Map<String, Object>> out = new ArrayList<>(sorted.size());
+        for (Match match : sorted) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("match", match);
+            boolean live = "LIVE".equals(match.getStatus());
+            entry.put("match_result",   live ? live1X2(match)      : preMatch1X2(match));
+            entry.put("asian_handicap", live ? liveHandicap(match) : preMatchHandicap(match));
+            out.add(entry);
+        }
+        log.debug("withAllOdds: bundled {} entries", out.size());
+        return out;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // LIVE ODDS CACHE REFRESH
+    // ══════════════════════════════════════════════════════════════════════
+
+    public void refreshLiveOddsCache(List<Match> liveMatches) {
+        if (liveMatches.isEmpty()) return;
+        int refreshed1X2 = 0, refreshedHandicap = 0;
+        for (Match match : liveMatches) {
+            int scoreHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
+            int scoreAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
+            int minute    = extractMinute(match);
+            try {
+                List<Map<String, Object>> liveOdds = liveOddsGeneratorService.generateLiveOdds(
+                        match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
+                // Never cache an empty list — live1X2() will fall back to pre-match odds instead
+                if (liveOdds != null && !liveOdds.isEmpty()) {
+                    cacheLiveOdds(match.getId(), liveOdds);
+                    refreshed1X2++;
+                } else {
+                    log.warn("refreshLiveOddsCache [1X2]: matchId={} generator returned empty — not caching", match.getId());
+                }
+            } catch (Exception e) {
+                log.warn("refreshLiveOddsCache [1X2]: matchId={} failed — {}", match.getId(), e.getMessage());
+            }
+            try {
+                List<Map<String, Object>> liveHandicap = handicapOddsService.generateLiveHandicapOdds(
+                        match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
+                if (liveHandicap != null && !liveHandicap.isEmpty()) {
+                    cacheLiveHandicapOdds(match.getId(), liveHandicap);
+                    refreshedHandicap++;
+                } else {
+                    log.warn("refreshLiveOddsCache [Handicap]: matchId={} generator returned empty — not caching", match.getId());
+                }
+            } catch (Exception e) {
+                log.warn("refreshLiveOddsCache [Handicap]: matchId={} failed — {}", match.getId(), e.getMessage());
+            }
+        }
+        log.info("refreshLiveOddsCache: 1X2={}/{} Handicap={}/{} match(es) refreshed",
+                refreshed1X2, liveMatches.size(), refreshedHandicap, liveMatches.size());
+    }
+
+    private int extractMinute(Match match) {
+        if (match.getMetadata() != null) {
+            Object min = match.getMetadata().get("minute");
+            if (min != null) {
+                try { return Integer.parseInt(min.toString()); } catch (NumberFormatException ignored) {}
+            }
+        }
+        if (match.getKickoffAt() != null && isRealKickoff(match.getKickoffAt())) {
+            long elapsed = ChronoUnit.MINUTES.between(match.getKickoffAt(), Instant.now());
+            return (int) Math.min(Math.max(elapsed, 0), 95);
+        }
+        return 45;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ODDS — direct endpoints
+    // ══════════════════════════════════════════════════════════════════════
+
+    public List<Map<String, Object>> getMatchOdds(String id) {
+        Match match = getById(id);
+        return "LIVE".equals(match.getStatus()) ? live1X2(match) : preMatch1X2(match);
+    }
+
+    public List<Map<String, Object>> getCorrectScoreOdds(String id) {
+        Match match = getById(id);
+        return correctScoreOddsService.generateCorrectScoreOdds(
+                match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+    }
+
+    public List<Map<String, Object>> getHalfTimeOdds(String id) {
+        Match match = getById(id);
+        if ("LIVE".equals(match.getStatus())) {
+            int scoreHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
+            int scoreAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
+            int minute    = extractMinute(match);
+            List<Map<String, Object>> liveHt = halfTimeOddsService.generateLiveHalfTimeOdds(
+                    match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
+            if (liveHt != null && !liveHt.isEmpty()) return liveHt;
+        }
+        return halfTimeOddsService.generateHalfTimeOdds(
+                match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+    }
+
+    public List<Map<String, Object>> getHandicapOdds(String id) {
+        Match match = getById(id);
+        return "LIVE".equals(match.getStatus()) ? liveHandicap(match) : preMatchHandicap(match);
+    }
+
+    public Map<String, Object> getAllOddsForMatch(String id) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("match_result",   getMatchOdds(id));
+        result.put("correct_score",  getCorrectScoreOdds(id));
+        result.put("half_time",      getHalfTimeOdds(id));
+        result.put("asian_handicap", getHandicapOdds(id));
+        return result;
+    }
+
+    /**
+     * Returns stored odds rows for a match. If the match has no 1X2 row yet,
+     * odds are generated and persisted first, so a game is never returned bare.
+     */
+    @Transactional
+    public List<Odds> getOddsForMatch(String id) {
+        Match match = getById(id);
+        oddsPersistenceService.ensureOddsForMatch(match); // no-op if 1X2 already stored
+        return oddsRepo.findByMatchId(match.getId());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // MATCH DETAIL / EVENTS / H2H / STATS / LINEUPS
+    // ══════════════════════════════════════════════════════════════════════
+
+    public Map<String, Object> getMatchDetail(String id) {
+        Match match = getById(id);
+        if (match.getExternalId() == null) return Map.of();
+        EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
+        if (league != null) {
+            String eventId = stripEspnPrefix(match.getExternalId());
+            Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
+            if (!summary.isEmpty()) return Map.of("source", "espn-football", "data", summary);
+        }
+        return Map.of();
+    }
+
+    public Map<String, Object> getEvents(String id) {
+        Match match = getById(id);
+        if (match.getMetadata() != null && !match.getMetadata().isEmpty()) {
+            return match.getMetadata();
+        }
+        EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
+        if (league != null && match.getExternalId() != null) {
+            String eventId = stripEspnPrefix(match.getExternalId());
+            Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
+            if (!summary.isEmpty()) return Map.of("source", "espn-football", "data", summary);
+        }
+        return Map.of("events", List.of());
+    }
+
+    @Cacheable(value = "h2h", key = "#id")
+    public Map<String, Object> getH2H(String id) {
+        Match match = getById(id);
+        if (match.getExternalId() == null) return Map.of();
+        EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
+        if (league != null) {
+            String eventId = stripEspnPrefix(match.getExternalId());
+            Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
+            List<Map<String, Object>> h2h = espnFootballDataService.extractHeadToHead(summary);
+            if (!h2h.isEmpty()) return Map.of("source", "espn-football", "data", h2h);
+        }
+        return Map.of();
+    }
+
+    public Map<String, Object> getStats(String id) {
+        Match match = getById(id);
+        if (match.getExternalId() == null) return Map.of();
+        EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
+        if (league != null) {
+            String eventId = stripEspnPrefix(match.getExternalId());
+            Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
+            if (!summary.isEmpty()) {
+                return Map.of("source", "espn-football", "type", "match_stats", "data", summary);
+            }
+        }
+        return Map.of();
+    }
+
+    @Cacheable(value = "lineups", key = "#id")
+    public Map<String, Object> getLineups(String id) {
+        Match match = getById(id);
+        if (match.getExternalId() == null) return Map.of();
+        EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
+        if (league != null) {
+            String eventId = stripEspnPrefix(match.getExternalId());
+            Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
+            if (!summary.isEmpty()) return Map.of("source", "espn-football", "data", summary);
+        }
+        return Map.of();
+    }
+
+    public List<Map<String, Object>> getEspnFinishedMatchesByLeague(EspnFootballDataService.EspnLeague league) {
+        log.info("getEspnFinishedMatchesByLeague: fetching finished events for league='{}'", league.displayName());
+        List<Map<String, Object>> finished = espnFootballDataService.getFinishedMatches(league);
+        log.info("getEspnFinishedMatchesByLeague: {} finished event(s) for league='{}'", finished.size(), league.displayName());
+        return finished;
+    }
+
+    public List<Map<String, Object>> getEspnFinishedMatchesByCup(EspnFootballDataService.EspnCup cup) {
+        log.info("getEspnFinishedMatchesByCup: fetching finished events for cup='{}'", cup.displayName());
+        List<Map<String, Object>> finished = espnFootballDataService.getCupFinishedMatches(cup);
+        log.info("getEspnFinishedMatchesByCup: {} finished event(s) for cup='{}'", finished.size(), cup.displayName());
+        return finished;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ALL-LEAGUES TODAY / LIVE / UPCOMING (ESPN)
+    // ══════════════════════════════════════════════════════════════════════
+
+    public Map<String, List<Map<String, Object>>> getEspnAllMatchesTodayByStatus() {
+        log.info("getEspnAllMatchesTodayByStatus: fetching all leagues + cups today by status");
+        Map<String, List<Map<String, Object>>> result = espnFootballDataService.getAllMatchesTodayByStatus();
+        log.info("getEspnAllMatchesTodayByStatus: live={}, upcoming={}, finished={}",
+                result.getOrDefault("live",     List.of()).size(),
+                result.getOrDefault("upcoming", List.of()).size(),
+                result.getOrDefault("finished", List.of()).size());
+        return result;
+    }
+
+    public List<Map<String, Object>> getEspnAllLiveMatchesToday() {
+        log.info("getEspnAllLiveMatchesToday: fetching all leagues + cups live");
+        List<Map<String, Object>> events = espnFootballDataService.getAllLiveMatchesToday();
+        log.info("getEspnAllLiveMatchesToday: {} live event(s)", events.size());
+        return events;
+    }
+
+    public List<Map<String, Object>> getEspnAllUpcomingMatchesToday() {
+        log.info("getEspnAllUpcomingMatchesToday: fetching all leagues + cups upcoming today");
+        List<Map<String, Object>> events = espnFootballDataService.getAllUpcomingMatchesToday();
+        log.info("getEspnAllUpcomingMatchesToday: {} upcoming event(s)", events.size());
+        return events;
+    }
+
+    public List<Map<String, Object>> getEspnAllFinishedMatchesToday() {
+        log.info("getEspnAllFinishedMatchesToday: fetching all leagues + cups finished today");
+        List<Map<String, Object>> events = espnFootballDataService.getAllFinishedMatchesToday();
+        log.info("getEspnAllFinishedMatchesToday: {} finished event(s)", events.size());
+        return events;
+    }
+
+    public Map<String, List<Map<String, Object>>> getEspnUpcomingFixturesNext7Days() {
+        log.info("getEspnUpcomingFixturesNext7Days: fetching all leagues + cups next 7 days");
+        Map<String, List<Map<String, Object>>> byDate = espnFootballDataService.getUpcomingFixturesNext7Days();
+        int total = byDate.values().stream().mapToInt(List::size).sum();
+        log.info("getEspnUpcomingFixturesNext7Days: {} date(s), {} total fixture(s)", byDate.size(), total);
+        return byDate;
+    }
+
+    public List<Map<String, Object>> getEspnUpcomingFixturesNext7DaysFlatList() {
+        log.info("getEspnUpcomingFixturesNext7DaysFlatList: fetching flat list all leagues + cups");
+        List<Map<String, Object>> fixtures = espnFootballDataService.getUpcomingFixturesNext7DaysFlatList();
+        log.info("getEspnUpcomingFixturesNext7DaysFlatList: {} total fixture(s)", fixtures.size());
+        return fixtures;
+    }
+
+    public List<Map<String, Object>> getEspnAllFixturesByDate(String dateYmd) {
+        log.info("getEspnAllFixturesByDate: fetching all leagues + cups for date='{}'", dateYmd);
+        List<Map<String, Object>> fixtures = espnFootballDataService.getAllUpcomingFixturesByDate(dateYmd);
+        log.info("getEspnAllFixturesByDate: {} fixture(s) for date='{}'", fixtures.size(), dateYmd);
+        return fixtures;
+    }
+
+    public List<Map<String, Object>> getEspnAllLeaguesTodayMatches() {
+        log.info("getEspnAllLeaguesTodayMatches: fetching today's events from all ESPN leagues");
+        List<Map<String, Object>> events = espnFootballDataService.getAllLeaguesTodayMatches();
+        log.info("getEspnAllLeaguesTodayMatches: {} total deduplicated event(s) returned", events.size());
+        return events;
+    }
+
+    public List<Map<String, Object>> getEspnAllCupsTodayMatches() {
+        log.info("getEspnAllCupsTodayMatches: fetching today's events from all ESPN cup competitions");
+        List<Map<String, Object>> events = espnFootballDataService.getAllCupsTodayMatches();
+        log.info("getEspnAllCupsTodayMatches: {} total deduplicated event(s) returned", events.size());
+        return events;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // FIXTURES BY DATE (ESPN)
+    // ══════════════════════════════════════════════════════════════════════
+
+    public List<Map<String, Object>> getEspnTop6FixturesByDate(String date) {
+        log.info("getEspnTop6FixturesByDate: fetching Top-6 league fixtures for date='{}'", date);
+        List<Map<String, Object>> fixtures = espnFootballDataService.getTop6UpcomingFixturesByDate(date);
+        log.info("getEspnTop6FixturesByDate: {} event(s) for date='{}'", fixtures.size(), date);
+        return fixtures;
+    }
+
+    public List<Map<String, Object>> getEspnTop6CupsFixturesByDate(String date) {
+        log.info("getEspnTop6CupsFixturesByDate: fetching Top-6 cup fixtures for date='{}'", date);
+        List<Map<String, Object>> fixtures = espnFootballDataService.getTop6CupsUpcomingFixturesByDate(date);
+        log.info("getEspnTop6CupsFixturesByDate: {} event(s) for date='{}'", fixtures.size(), date);
+        return fixtures;
+    }
+
+    public Map<String, Object> getCupMatchDetail(EspnFootballDataService.EspnCup cup, String eventId) {
+        log.info("getCupMatchDetail: fetching summary for cup='{}' eventId='{}'", cup.displayName(), eventId);
+        Map<String, Object> summary = espnFootballDataService.getCupMatchSummary(cup, eventId);
+        if (summary.isEmpty()) {
+            log.warn("getCupMatchDetail: empty summary for cup='{}' eventId='{}'", cup.displayName(), eventId);
+            return Map.of();
+        }
+        log.info("getCupMatchDetail: summary fetched for cup='{}' eventId='{}'", cup.displayName(), eventId);
+        return Map.of("source", "espn-football", "cup", cup.displayName(), "data", summary);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ENRICHED MATCH DATA EXTRACTORS (ESPN)
+    // ══════════════════════════════════════════════════════════════════════
+
+    public Map<String, Object> getEspnMatchOdds(String id) {
+        Match match = getById(id);
+        if (match.getExternalId() == null) { log.debug("getEspnMatchOdds: matchId={} has no externalId", id); return Map.of(); }
+        EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
+        if (league == null) { log.debug("getEspnMatchOdds: no ESPN league resolved for matchId={}", id); return Map.of(); }
+        String eventId = stripEspnPrefix(match.getExternalId());
+        log.info("getEspnMatchOdds: extracting ESPN odds for matchId={} eventId='{}'", id, eventId);
+        Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
+        Map<String, Object> odds    = espnFootballDataService.extractMatchOdds(summary);
+        log.info("getEspnMatchOdds: {} provider(s) found for matchId={}", odds.size(), id);
+        return odds;
+    }
+
+    public Map<String, List<Map<String, Object>>> getEspnGoalscorerOdds(String id) {
+        Match match = getById(id);
+        if (match.getExternalId() == null) { log.debug("getEspnGoalscorerOdds: matchId={} has no externalId", id); return Map.of(); }
+        EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
+        if (league == null) { log.debug("getEspnGoalscorerOdds: no ESPN league resolved for matchId={}", id); return Map.of(); }
+        String eventId = stripEspnPrefix(match.getExternalId());
+        log.info("getEspnGoalscorerOdds: extracting goalscorer markets for matchId={} eventId='{}'", id, eventId);
+        Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
+        Map<String, List<Map<String, Object>>> markets = espnFootballDataService.extractPlayerGoalscorerOdds(summary);
+        log.info("getEspnGoalscorerOdds: {} market(s) found for matchId={}", markets.size(), id);
+        return markets;
+    }
+
+    public List<Map<String, Object>> getEspnRecentForm(String id) {
+        Match match = getById(id);
+        if (match.getExternalId() == null) { log.debug("getEspnRecentForm: matchId={} has no externalId", id); return List.of(); }
+        EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
+        if (league == null) { log.debug("getEspnRecentForm: no ESPN league resolved for matchId={}", id); return List.of(); }
+        String eventId = stripEspnPrefix(match.getExternalId());
+        log.info("getEspnRecentForm: fetching recent form for matchId={} eventId='{}'", id, eventId);
+        Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
+        List<Map<String, Object>> form = espnFootballDataService.extractRecentForm(summary);
+        log.info("getEspnRecentForm: {} team form block(s) for matchId={}", form.size(), id);
+        return form;
+    }
+
+    public List<Map<String, Object>> getEspnMatchNews(String id) {
+        Match match = getById(id);
+        if (match.getExternalId() == null) { log.debug("getEspnMatchNews: matchId={} has no externalId", id); return List.of(); }
+        EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
+        if (league == null) { log.debug("getEspnMatchNews: no ESPN league resolved for matchId={}", id); return List.of(); }
+        String eventId = stripEspnPrefix(match.getExternalId());
+        log.info("getEspnMatchNews: fetching news articles for matchId={} eventId='{}'", id, eventId);
+        Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
+        List<Map<String, Object>> articles = espnFootballDataService.extractMatchNews(summary);
+        log.info("getEspnMatchNews: {} article(s) for matchId={}", articles.size(), id);
+        return articles;
+    }
+
+    public List<Map<String, Object>> getEspnMatchVideos(String id) {
+        Match match = getById(id);
+        if (match.getExternalId() == null) { log.debug("getEspnMatchVideos: matchId={} has no externalId", id); return List.of(); }
+        EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
+        if (league == null) { log.debug("getEspnMatchVideos: no ESPN league resolved for matchId={}", id); return List.of(); }
+        String eventId = stripEspnPrefix(match.getExternalId());
+        log.info("getEspnMatchVideos: fetching videos for matchId={} eventId='{}'", id, eventId);
+        Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
+        List<Map<String, Object>> videos = espnFootballDataService.extractMatchVideos(summary);
+        log.info("getEspnMatchVideos: {} video(s) for matchId={}", videos.size(), id);
+        return videos;
+    }
+
+    public String getEspnMatchVenue(String id) {
+        Match match = getById(id);
+        if (match.getExternalId() == null) { log.debug("getEspnMatchVenue: matchId={} has no externalId", id); return ""; }
+        EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
+        if (league == null) { log.debug("getEspnMatchVenue: no ESPN league resolved for matchId={}", id); return ""; }
+        String eventId = stripEspnPrefix(match.getExternalId());
+        log.info("getEspnMatchVenue: fetching venue for matchId={} eventId='{}'", id, eventId);
+        Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
+        Object eventData = summary.get("header");
+        if (eventData instanceof Map<?, ?> header) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> headerMap = (Map<String, Object>) header;
+            Object competitions = headerMap.get("competitions");
+            if (competitions instanceof java.util.List<?> compList && !compList.isEmpty()) {
+                Map<String, Object> fakeEvent = new LinkedHashMap<>();
+                fakeEvent.put("competitions", compList);
+                String venue = EspnFootballDataService.extractVenue(fakeEvent);
+                log.info("getEspnMatchVenue: venue='{}' for matchId={}", venue, id);
+                return venue;
+            }
+        }
+        log.debug("getEspnMatchVenue: no venue data in summary for matchId={}", id);
+        return "";
+    }
+
+    public Map<String, Object> getEspnTeamsByLeague(EspnFootballDataService.EspnLeague league) {
+        log.info("getEspnTeamsByLeague: fetching team list for league='{}'", league.displayName());
+        Map<String, Object> teams = espnFootballDataService.getTeams(league);
+        log.info("getEspnTeamsByLeague: team data fetched for league='{}'", league.displayName());
+        return teams;
+    }
+
+    public Map<String, Object> getEspnTeamSchedule(CompetitionIds.Top6League league, String teamId) {
+        EspnFootballDataService.EspnLeague espnLeague = toEspnLeague(league);
+        if (espnLeague == null) {
+            log.warn("getEspnTeamSchedule: no ESPN mapping for league='{}' teamId='{}'", league.displayName(), teamId);
+            return Map.of();
+        }
+        return getEspnTeamSchedule(espnLeague, teamId);
+    }
+
+    public Map<String, Object> getEspnTeamSchedule(EspnFootballDataService.EspnLeague league, String teamId) {
+        log.info("getEspnTeamSchedule: fetching schedule for teamId='{}' in league='{}'", teamId, league.displayName());
+        Map<String, Object> schedule = espnFootballDataService.getTeamSchedule(league, teamId);
+        log.info("getEspnTeamSchedule: schedule data fetched for teamId='{}' league='{}'", teamId, league.displayName());
+        return schedule;
+    }
+
+    public List<Match> getSettledFinished() {
+        return matchRepo.findSettledFinished();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // STANDINGS / SCORERS
+    // ══════════════════════════════════════════════════════════════════════
+
+    public Map<String, Object> getStandingsByLeague(CompetitionIds.Top6League league) {
+        EspnFootballDataService.EspnLeague espnLeague = toEspnLeague(league);
+        if (espnLeague == null) return Map.of();
+        return espnFootballDataService.getStandings(espnLeague);
+    }
+
+    public Map<String, Object> getStandingsByLeague(EspnFootballDataService.EspnLeague league) {
+        return espnFootballDataService.getStandings(league);
+    }
+
+    public Map<String, Object> getStandingsByCup(CompetitionIds.CupCompetition cup) {
+        EspnFootballDataService.EspnCup espnCup = toEspnCup(cup);
+        if (espnCup == null) return Map.of();
+        return espnFootballDataService.getCupStandings(espnCup);
+    }
+
+    public Map<String, Object> getStandingsByCup(EspnFootballDataService.EspnCup cup) {
+        return espnFootballDataService.getCupStandings(cup);
+    }
+
+    public Map<String, Object> getStandingsByLeagueComp(CompetitionIds.LeagueCompetition league) {
+        EspnFootballDataService.EspnLeague espnLeague = toEspnLeagueFromComp(league);
+        if (espnLeague == null) return Map.of();
+        return espnFootballDataService.getStandings(espnLeague);
+    }
+
+    public Map<String, Map<String, Object>> getAllTop6Standings() {
+        return espnFootballDataService.getTop6Standings();
+    }
+
+    public Map<String, Object> getTopScorersByLeague(CompetitionIds.Top6League league) {
+        log.debug("getTopScorersByLeague: top-scorers endpoint not available via ESPN for league='{}'", league.displayName());
+        return Map.of();
+    }
+
+    public Map<String, Object> getTopScorersByLeague(EspnFootballDataService.EspnLeague league) {
+        log.debug("getTopScorersByLeague: top-scorers endpoint not available via ESPN for league='{}'", league.displayName());
+        return Map.of();
+    }
+
+    public Map<String, Object> getTopScorersByLeagueComp(CompetitionIds.LeagueCompetition league) {
+        log.debug("getTopScorersByLeagueComp: top-scorers endpoint not available via ESPN for league='{}'", league.displayName());
+        return Map.of();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ESPN FOOTBALL PASS-THROUGH HELPERS
+    // ══════════════════════════════════════════════════════════════════════
+
+    public List<Map<String, Object>> getEspnFootballLive()                { return espnFootballDataService.getTop6LiveMatches(); }
+    public List<Map<String, Object>> getEspnFootballToday()               { return espnFootballDataService.getTop6TodayMatches(); }
+    public List<Map<String, Object>> getEspnFootballFixtures()            { return espnFootballDataService.getTop6UpcomingMatches(); }
+    public List<Map<String, Object>> getEspnFootballTop6Live()            { return espnFootballDataService.getTop6LiveMatches(); }
+    public List<Map<String, Object>> getEspnFootballTop6CupsLive()        { return espnFootballDataService.getTop6CupsLiveMatches(); }
+    public List<Map<String, Object>> getEspnFootballTop6Fixtures()        { return espnFootballDataService.getTop6UpcomingMatches(); }
+    public List<Map<String, Object>> getEspnFootballTop6CupFixtures()     { return espnFootballDataService.getTop6CupsUpcomingMatches(); }
+
+    public List<Map<String, Object>> getEspnFootballTop6AndCupFixtures() {
+        List<Map<String, Object>> combined = new ArrayList<>();
+        combined.addAll(espnFootballDataService.getTop6UpcomingMatches());
+        combined.addAll(espnFootballDataService.getTop6CupsUpcomingMatches());
+        return combined;
+    }
+
+    public List<Map<String, Object>> getEspnFootballLiveByLeague(CompetitionIds.Top6League league) {
+        EspnFootballDataService.EspnLeague espnLeague = toEspnLeague(league);
+        if (espnLeague == null) return List.of();
+        return espnFootballDataService.getLiveMatches(espnLeague);
+    }
+
+    public List<Map<String, Object>> getEspnFootballLiveByLeague(EspnFootballDataService.EspnLeague league) {
+        return espnFootballDataService.getLiveMatches(league);
+    }
+
+    public List<Map<String, Object>> getEspnFootballFixturesByLeague(CompetitionIds.Top6League league) {
+        EspnFootballDataService.EspnLeague espnLeague = toEspnLeague(league);
+        if (espnLeague == null) return List.of();
+        return espnFootballDataService.getUpcomingMatches(espnLeague);
+    }
+
+    public List<Map<String, Object>> getEspnFootballFixturesByLeague(EspnFootballDataService.EspnLeague league) {
+        return espnFootballDataService.getUpcomingMatches(league);
+    }
+
+    public List<Map<String, Object>> getEspnFootballLiveByCup(CompetitionIds.CupCompetition cup) {
+        EspnFootballDataService.EspnCup espnCup = toEspnCup(cup);
+        if (espnCup == null) return List.of();
+        return espnFootballDataService.getCupLiveMatches(espnCup);
+    }
+
+    public List<Map<String, Object>> getEspnFootballLiveByCup(EspnFootballDataService.EspnCup cup) {
+        return espnFootballDataService.getCupLiveMatches(cup);
+    }
+
+    public List<Map<String, Object>> getEspnFootballFixturesByCup(CompetitionIds.CupCompetition cup) {
+        EspnFootballDataService.EspnCup espnCup = toEspnCup(cup);
+        if (espnCup == null) return List.of();
+        return espnFootballDataService.getCupUpcomingMatches(espnCup);
+    }
+
+    public List<Map<String, Object>> getEspnFootballFixturesByCup(EspnFootballDataService.EspnCup cup) {
+        return espnFootballDataService.getCupUpcomingMatches(cup);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // PREDICTIONS
+    // ══════════════════════════════════════════════════════════════════════
+
+    public Map<String, Object> getPrediction(String id) {
+        Match match = getById(id);
+        if (match.getExternalId() == null) return Map.of();
+        Map<String, Object> context = new HashMap<>();
+        context.put("home_team", match.getHomeTeam());
+        context.put("away_team", match.getAwayTeam());
+        context.put("league",    match.getLeague());
+        context.put("kickoff",   match.getKickoffAt());
+        try {
+            Map<String, Object> ai = mistralClient.predictMatch(context);
+            if (ai != null && !ai.isEmpty()) return Map.of("source", "ai", "data", ai);
+        } catch (Exception e) {
+            log.warn("getPrediction: matchId={} failed — {}", id, e.getMessage());
+        }
+        return Map.of();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // PERSISTENCE
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Transactional
+    public Match saveOrUpdate(Match match) {
+        // FIX: Only evict caches that are actually affected by this match.
+        // Previously used @CacheEvict on every save, busting todayMatches
+        // on every single fixture update (pollers call this hundreds of times/min).
+        boolean evictToday    = isToday(match);
+        boolean evictFeatured = match.isFeatured(); // FIX: was getFeatured() — Lombok generates isFeatured() for boolean
+
+        Match saved = doSaveOrUpdate(match);
+
+        // Guarantee: every saved game has odds in the DB.
+        // ensureOddsForMatch is a cheap no-op when the match already has 1X2 odds.
+        try {
+            oddsPersistenceService.ensureOddsForMatch(saved);
+        } catch (Exception e) {
+            // Never let an odds problem block saving the match itself
+            log.error("saveOrUpdate: odds backfill failed for matchId={} — {}",
+                    saved.getId(), e.getMessage(), e);
+        }
+
+        if (evictToday || evictFeatured) {
+            log.debug("saveOrUpdate: evicting relevant caches for matchId={} today={} featured={}",
+                    saved.getId(), evictToday, evictFeatured);
+            evictMatchCaches(evictToday, evictFeatured);
+        }
+
+        return saved;
+    }
+
+    // FIX: uses CacheManager directly so eviction is conditional and works without
+    // Spring AOP proxy (self-invocation). Removed @CacheEvict annotation.
+    public void evictMatchCaches(boolean evictToday, boolean evictFeatured) {
+        if (evictToday) {
+            clearCache("matches");
+            clearCache("todayMatches");
+            clearCache("futureMatches");
+        }
+        if (evictFeatured) {
+            clearCache("featuredMatches");
+        }
+    }
+
+    private Match doSaveOrUpdate(Match match) {
+        if (match.getExternalId() == null || match.getExternalId().isBlank())
+            return matchRepo.save(match);
+
+        return matchRepo.findByExternalId(match.getExternalId())
+                .map(existing -> {
+                    if (match.getStatus() != null) {
+                        if (isPermittedTransition(existing.getStatus(), match.getStatus())) {
+                            if (("UPCOMING".equals(existing.getStatus()) || "SCHEDULED".equals(existing.getStatus()))
+                                    && !match.getStatus().equals(existing.getStatus())) {
+                                evictPreMatchCache(existing.getId());
+                            }
+                            existing.setStatus(match.getStatus());
+                        } else {
+                            if (warnedDemotions.getIfPresent(existing.getExternalId()) == null) {
+                                warnedDemotions.put(existing.getExternalId(), true);
+                                log.warn("saveOrUpdate: blocked status demotion externalId={} {} → {} (keeping {})",
+                                        existing.getExternalId(),
+                                        existing.getStatus(), match.getStatus(),
+                                        existing.getStatus());
+                            } else {
+                                log.debug("saveOrUpdate: repeated demotion blocked externalId={} {} → {} (keeping {})",
+                                        existing.getExternalId(),
+                                        existing.getStatus(), match.getStatus(),
+                                        existing.getStatus());
+                            }
+                            return matchRepo.save(existing);
+                        }
+                    }
+
+                    if (match.getScoreHome() != null) existing.setScoreHome(match.getScoreHome());
+                    if (match.getScoreAway() != null) existing.setScoreAway(match.getScoreAway());
+                    if (match.getMetadata()  != null) existing.setMetadata(match.getMetadata());
+                    if (!isMissing(match.getLeague())) existing.setLeague(match.getLeague());
+                    if (isMissing(existing.getHomeTeam())   && !isMissing(match.getHomeTeam()))   existing.setHomeTeam(match.getHomeTeam());
+                    if (isMissing(existing.getAwayTeam())   && !isMissing(match.getAwayTeam()))   existing.setAwayTeam(match.getAwayTeam());
+                    if ((isMissing(existing.getSport()) || existing.getSportEnum() == null)
+                            && (!isMissing(match.getSport()) || match.getSportEnum() != null)) {
+                        Sport sportEnum = match.getSportEnum() != null
+                                ? match.getSportEnum()
+                                : Sport.fromKey(match.getSport());
+                        existing.setSportEnum(sportEnum);
+                        existing.setSport(sportEnum.key());
+                        log.debug("saveOrUpdate: updated sportEnum={} for externalId={}", sportEnum, existing.getExternalId());
+                    }
+                    if (isMissing(existing.getHomeLogo())   && !isMissing(match.getHomeLogo()))   existing.setHomeLogo(match.getHomeLogo());
+                    if (isMissing(existing.getAwayLogo())   && !isMissing(match.getAwayLogo()))   existing.setAwayLogo(match.getAwayLogo());
+                    if (isMissing(existing.getLeagueLogo()) && !isMissing(match.getLeagueLogo())) existing.setLeagueLogo(match.getLeagueLogo());
+                    if (existing.getSource() == null && match.getSource() != null)                existing.setSource(match.getSource());
+
+                    if (match.getKickoffAt() != null) {
+                        log.debug("saveOrUpdate: updating kickoffAt externalId={} old={} new={}",
+                                existing.getExternalId(), existing.getKickoffAt(), match.getKickoffAt());
+                        existing.setKickoffAt(match.getKickoffAt());
+                    }
+
+                    log.debug("saveOrUpdate: updated externalId={} status='{}' home='{}' away='{}' league='{}' kickoff='{}'",
+                            existing.getExternalId(), existing.getStatus(),
+                            existing.getHomeTeam(), existing.getAwayTeam(),
+                            existing.getLeague(), existing.getKickoffAt());
+                    return matchRepo.save(existing);
+                })
+                .orElseGet(() -> {
+                    log.debug("saveOrUpdate: inserting new externalId={} home='{}' away='{}' league='{}' kickoff='{}'",
+                            match.getExternalId(), match.getHomeTeam(), match.getAwayTeam(),
+                            match.getLeague(), match.getKickoffAt());
+                    return matchRepo.save(match);
+                });
+    }
+
+    @Transactional
+    public int finishStaleLiveMatches(Instant cutoff) {
+        List<Match> stale = matchRepo.findStaleLiveBySport("football", cutoff, MatchSource.ADMIN_CREATED);
+        if (stale.isEmpty()) return 0;
+        log.info("finishStaleLiveMatches: force-finishing {} stale football match(es)", stale.size());
+        for (Match m : stale) { m.setStatus("FINISHED"); matchRepo.save(m); }
+        clearCache("matches");
+        clearCache("todayMatches");
+        return stale.size();
+    }
+
+    @Transactional
+    public int finishStaleLiveMatches(Instant cutoff, String sport) {
+        List<Match> stale = matchRepo.findStaleLiveBySport(sport, cutoff, MatchSource.ADMIN_CREATED);
+        if (stale.isEmpty()) return 0;
+        log.info("finishStaleLiveMatches(sport='{}'): force-finishing {} stale match(es)", sport, stale.size());
+        for (Match m : stale) { m.setStatus("FINISHED"); matchRepo.save(m); }
+        clearCache("matches");
+        clearCache("todayMatches");
+        return stale.size();
+    }
+
+    public List<Match> getUnsettledFinished() {
+        return matchRepo.findUnsettledFinishedBySport("football");
+    }
+
+    /**
+     * Fixtures that were never played: still in a dormant status, kickoff before
+     * the cutoff, and no scores. The settlement engine voids bets on these —
+     * the feed (or an admin schedule) abandoned them, so no result is coming.
+     */
+    public List<Match> getStaleUnfinishedMatches(Instant cutoff, int limit) {
+        return matchRepo.findStaleUnfinished(
+                List.of("UPCOMING", "SCHEDULED", "POSTPONED", "CANCELLED"),
+                cutoff, PageRequest.of(0, limit));
+    }
+
+    @Transactional
+    public void markSettled(String id) {
+        matchRepo.findById(toUuid(id)).ifPresent(m -> {
+            m.setSettledAt(Instant.now());
+            matchRepo.save(m);
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // PRIVATE — ESPN ROUTING HELPERS
+    // ══════════════════════════════════════════════════════════════════════
+
+    private static String stripEspnPrefix(String externalId) {
+        if (externalId.startsWith("espn-")) return externalId.substring(5);
+        return externalId;
+    }
+
+    private EspnFootballDataService.EspnLeague resolveEspnLeague(Match match) {
+        if (match.getLeague() == null) return null;
+        String league = match.getLeague();
+        for (EspnFootballDataService.EspnLeague l : EspnFootballDataService.EspnLeague.values()) {
+            if (l.displayName().equalsIgnoreCase(league)) return l;
+        }
+        log.debug("resolveEspnLeague: no EspnLeague mapping for league='{}' matchId={}", league, match.getId());
+        return null;
+    }
+
+    private EspnFootballDataService.EspnLeague toEspnLeague(CompetitionIds.Top6League league) {
+        for (EspnFootballDataService.EspnLeague l : EspnFootballDataService.EspnLeague.values()) {
+            if (l.displayName().equalsIgnoreCase(league.displayName())) return l;
+        }
+        log.debug("toEspnLeague: no mapping for Top6League='{}'", league.displayName());
+        return null;
+    }
+
+    private EspnFootballDataService.EspnLeague toEspnLeagueFromComp(CompetitionIds.LeagueCompetition league) {
+        for (EspnFootballDataService.EspnLeague l : EspnFootballDataService.EspnLeague.values()) {
+            if (l.displayName().equalsIgnoreCase(league.displayName())) return l;
+        }
+        log.debug("toEspnLeagueFromComp: no mapping for LeagueCompetition='{}'", league.displayName());
+        return null;
+    }
+
+    private EspnFootballDataService.EspnCup toEspnCup(CompetitionIds.CupCompetition cup) {
+        for (EspnFootballDataService.EspnCup c : EspnFootballDataService.EspnCup.values()) {
+            if (c.displayName().equalsIgnoreCase(cup.displayName())) return c;
+        }
+        log.debug("toEspnCup: no mapping for CupCompetition='{}'", cup.displayName());
+        return null;
+    }
+}
