@@ -7,6 +7,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
 /**
@@ -16,6 +17,9 @@ import org.springframework.stereotype.Component;
  * BOOTSTRAP_SITE_OWNER_EMAIL) AND no SITE_OWNER exists yet AND a user with
  * that email exists, that user is promoted to SITE_OWNER.
  *
+ * Runs after UserRoleConstraintSync (@Order 2 vs 1) so the users_role_check
+ * constraint already allows SITE_OWNER before this promotion is attempted.
+ *
  * Operator flow: register a normal account for the owner, set the env var
  * to that email, start the app once, then REMOVE the env var. Without the
  * env var this runner does nothing, and once an owner exists it never
@@ -24,6 +28,7 @@ import org.springframework.stereotype.Component;
 @Slf4j
 @Component
 @RequiredArgsConstructor
+@Order(2)
 public class SiteOwnerBootstrap implements ApplicationRunner {
 
     private final UserRepository userRepo;
