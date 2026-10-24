@@ -19,6 +19,21 @@ public final class TransactionSpecs {
      *   kind, status, walletId, createdAt range.
      * Null / empty parameters are simply omitted from the WHERE clause.
      */
+    /**
+     * Restrict transactions to a set of wallets. An empty / null set matches
+     * nothing (never everything) — a fresh super admin with no branch yet
+     * sees an empty list, not the whole platform.
+     */
+    public static Specification<Transaction> walletIdIn(
+            java.util.Collection<UUID> walletIds) {
+        return (root, query, cb) -> {
+            if (walletIds == null || walletIds.isEmpty()) {
+                return cb.disjunction();
+            }
+            return root.get("walletId").in(walletIds);
+        };
+    }
+
     public static Specification<Transaction> filtered(
             TxKind kind,
             String status,
