@@ -2,7 +2,10 @@ FROM eclipse-temurin:21-jdk-alpine AS build
 WORKDIR /app
 COPY pom.xml .
 COPY src ./src
-RUN apk add --no-cache maven && mvn clean package -DskipTests -q
+# Detailed build logging: NO -q (quiet hid the real error — a missing method
+# cost an hour of guessing), -e prints full stack traces on failure.
+# Tests stay skipped; only the logging changes.
+RUN apk add --no-cache maven && mvn clean package -DskipTests -e
 
 FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
