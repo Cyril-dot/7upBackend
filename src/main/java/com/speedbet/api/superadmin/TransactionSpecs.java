@@ -12,6 +12,9 @@ import java.util.UUID;
 
 public final class TransactionSpecs {
 
+    // NOTE: walletIdIn was added to fix the Railway build (it was called by
+    // SuperAdminQueryService but missing). This comment re-triggers a fresh
+    // Railway deployment of the fixed tree — no functional change.
     private TransactionSpecs() {}
 
     /**
