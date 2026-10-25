@@ -61,4 +61,24 @@ public class SuperAdminWalletController {
 
         return ResponseEntity.ok(credited);
     }
+
+    /** Debit mirror of add-funds — same guards, but no commission change:
+     * commission is attributed on deposits only, and a manual debit does
+     * not claw it back. Works for any user — regular USER or ADMIN. */
+    @PostMapping("/users/{userId}/debit-funds")
+    public ResponseEntity<SuperAdminDtos.WalletCreditDto> debitFundsFromUser(
+            @PathVariable UUID userId,
+            @AuthenticationPrincipal com.speedbet.api.user.User actor,
+            @RequestBody AddFundsRequest request) {
+
+        log.info("POST /super-admin/users/{}/debit-funds — adminId='{}'", userId, actor.getId());
+        // Branch guard, same as add-funds: a super admin may only debit users
+        // inside their own subtree (or their own admins). The site owner passes through.
+        if (actor.getRole() == com.speedbet.api.user.UserRole.SUPER_ADMIN
+                && !hierarchy.isUserVisibleTo(actor.getId(), userId)) {
+            throw com.speedbet.api.common.ApiException.forbidden("User does not belong to your branch");
+        }
+        var debited = superAdminWalletService.debitFunds(userId, actor.getId(), request.parsedAmount(), request.reason(), request.idempotencyKey());
+        return ResponseEntity.ok(debited);
+    }
 }
