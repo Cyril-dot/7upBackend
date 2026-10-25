@@ -209,4 +209,78 @@ public interface TransactionRepository
           AND t.kind = :kind
         """)
     List<com.speedbet.api.superadmin.SuperAdminDtos.RevenueRawRow> findRawRowsByKind(@Param("kind") TxKind kind);
+
+    // ── OWNER STATS (site-owner command centre) ──────────────────────────────
+    //
+    // Why per-currency: a Transaction carries no currency of its own, but its
+    // Wallet does. Summing GH₵ and ₦ into one number would be meaningless, so
+    // every owner-stats sum is grouped by wallet currency and the frontend
+    // renders GH₵ and ₦ as separate lines. Never add the groups together.
+    //
+    // Daily series (Postgres date_trunc, same style as sumDepositsByDaySince).
+
+    @Query(
+            value = "SELECT date_trunc('day', t.created_at) AS bucketDate, " +
+                    "w.currency AS currency, " +
+                    "COALESCE(SUM(t.amount), 0) AS total " +
+                    "FROM transactions t, wallets w " +
+                    "WHERE t.wallet_id = w.id AND t.kind = 'DEPOSIT' AND t.created_at >= :since " +
+                    "GROUP BY date_trunc('day', t.created_at), w.currency " +
+                    "ORDER BY date_trunc('day', t.created_at), w.currency",
+            nativeQuery = true
+    )
+    java.util.List<DailyCurrencyDepositProjection> sumDepositsByDayAndCurrencySince(@Param("since") Instant since);
+
+    /** Native-query projection for the currency-split daily deposit series. */
+    interface DailyCurrencyDepositProjection {
+        Instant getBucketDate();
+        String getCurrency();
+        BigDecimal getTotal();
+    }
+
+    /** Per-currency sums for one TxKind, restricted to a wallet set. */
+    @Query("""
+        SELECT w.currency AS currency, COALESCE(SUM(t.amount), 0) AS total
+        FROM Transaction t, Wallet w
+        WHERE w.id = t.walletId AND t.kind = :kind AND t.walletId IN :walletIds
+        GROUP BY w.currency
+        """)
+    List<CurrencySumProjection> sumByKindAndWalletIdInGrouped(
+            @Param("kind") TxKind kind, @Param("walletIds") java.util.Collection<java.util.UUID> walletIds);
+
+    /** Per-currency sums for one TxKind since an instant, restricted to a wallet set. */
+    @Query("""
+        SELECT w.currency AS currency, COALESCE(SUM(t.amount), 0) AS total
+        FROM Transaction t, Wallet w
+        WHERE w.id = t.walletId AND t.kind = :kind AND t.createdAt >= :since
+          AND t.walletId IN :walletIds
+        GROUP BY w.currency
+        """)
+    List<CurrencySumProjection> sumByKindSinceAndWalletIdInGrouped(
+            @Param("kind") TxKind kind, @Param("since") Instant since,
+            @Param("walletIds") java.util.Collection<java.util.UUID> walletIds);
+
+    /** Per-currency sums for one TxKind, platform-wide. */
+    @Query("""
+        SELECT w.currency AS currency, COALESCE(SUM(t.amount), 0) AS total
+        FROM Transaction t, Wallet w
+        WHERE w.id = t.walletId AND t.kind = :kind
+        GROUP BY w.currency
+        """)
+    List<CurrencySumProjection> sumAllByKindGrouped(@Param("kind") TxKind kind);
+
+    /** Per-currency sums for one TxKind since an instant, platform-wide. */
+    @Query("""
+        SELECT w.currency AS currency, COALESCE(SUM(t.amount), 0) AS total
+        FROM Transaction t, Wallet w
+        WHERE w.id = t.walletId AND t.kind = :kind AND t.createdAt >= :since
+        GROUP BY w.currency
+        """)
+    List<CurrencySumProjection> sumAllByKindSinceGrouped(@Param("kind") TxKind kind, @Param("since") Instant since);
+
+    /** JPQL projection for per-currency sums. */
+    interface CurrencySumProjection {
+        String getCurrency();
+        BigDecimal getTotal();
+    }
 }
