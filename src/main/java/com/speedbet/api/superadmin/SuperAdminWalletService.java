@@ -69,4 +69,57 @@ public class SuperAdminWalletService {
                 tx.getId()
         );
     }
+
+    /**
+     * Debits any user's wallet (regular USER or ADMIN — both are just Users).
+     * Mirror of addFunds, but recorded as a manual ADJUSTMENT (not a
+     * withdrawal): WalletService.debit refuses to go below zero — it throws
+     * 422 "Insufficient balance" under a pessimistic wallet lock — so a
+     * debit can never push a balance negative. Commission is deliberately
+     * NOT touched: commission is attributed on deposits only, and clawing
+     * it back on a manual debit is a separate policy decision.
+     */
+    @Transactional
+    public SuperAdminDtos.WalletCreditDto debitFunds(UUID userId, UUID adminId, BigDecimal amount, String reason, String idempotencyKey) {
+        User target = userRepo.findById(userId)
+                .orElseThrow(() -> ApiException.notFound("User not found"));
+
+        if (amount == null || amount.signum() <= 0) {
+            throw ApiException.badRequest("Amount must be greater than zero");
+        }
+
+        log.info("debitFunds: adminId='{}' debiting userId='{}' (role={}) amount='{}'",
+                adminId, userId, target.getRole(), amount);
+
+        // Same idempotency shape as addFunds; debit() itself does not
+        // 409 on a repeated provider ref, so check explicitly here.
+        String providerRef = idempotencyKey == null || idempotencyKey.isBlank()
+                ? null : "debitfunds:" + idempotencyKey.trim();
+        if (providerRef != null && walletService.alreadyProcessed(providerRef)) {
+            throw ApiException.conflict("Transaction already processed: " + providerRef);
+        }
+        Transaction tx = walletService.debit(
+                userId,
+                amount,
+                TxKind.ADJUSTMENT,
+                providerRef,
+                Map.of(
+                        "source", "SUPER_ADMIN",
+                        "adminId", adminId.toString(),
+                        "targetRole", target.getRole().name(),
+                        "reason", reason == null ? "" : reason
+                )
+        );
+
+        log.info("debitFunds: userId='{}' debited amount='{}' newBalance='{}' by adminId='{}'",
+                userId, amount, tx.getBalanceAfter(), adminId);
+
+        return new SuperAdminDtos.WalletCreditDto(
+                userId,
+                amount,
+                tx.getBalanceAfter(),
+                "Funds removed successfully",
+                tx.getId()
+        );
+    }
 }
