@@ -198,7 +198,7 @@ public class GatewayService {
     }
 
     private void supersedePending(User owner, UUID saId) {
-        for (var pending : requestRepo.findBySuperAdminIdAndStatus(saId, "PENDING")) {
+        for (var pending : requestRepo.findAllBySuperAdminIdAndStatus(saId, "PENDING")) {
             pending.setStatus("REJECTED");
             pending.setDecidedBy(owner.getId());
             pending.setDecidedAt(Instant.now());
