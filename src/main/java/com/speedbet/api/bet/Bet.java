@@ -55,6 +55,15 @@ public class Bet {
     @Column(name = "booking_code_used_id")
     private UUID bookingCodeUsedId;
 
+    /**
+     * Server-generated shareable ticket code for THIS bet (GB + 8 unambiguous
+     * chars, e.g. GB7KQ2X9M4). Set on every placed bet, all roles — replaces
+     * the frontend's locally invented GB+random code, which was never stored
+     * server-side and could not be quoted to support or re-found. Unique.
+     */
+    @Column(name = "booking_code", unique = true, length = 12)
+    private String bookingCode;
+
     // ── Cashout fields ────────────────────────────────────────────────────
 
     /** Amount credited to the wallet when this bet was cashed out. Null if not cashed out. */

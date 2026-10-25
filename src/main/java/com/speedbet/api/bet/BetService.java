@@ -20,6 +20,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.MathContext;
+import java.security.SecureRandom;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -163,6 +164,7 @@ public class BetService {
                 .potentialReturn(potentialReturn)
                 .status(BetStatus.PENDING)
                 .bookingCodeUsedId(req.bookingCodeUsedId())
+                .bookingCode(generateUniqueBetCode())
                 .build();
         bet = betRepo.save(bet);
         log.info("placeBet — bet persisted id={}", bet.getId());
@@ -325,6 +327,28 @@ public class BetService {
             walletService.credit(bet.getUserId(), payout, TxKind.ADJUSTMENT,
                     ref, Map.of("betId", bet.getId().toString(), "reason", "void-refund"));
         }
+    }
+
+    /**
+     * Server-side ticket code for a placed bet: GB + 8 unambiguous chars
+     * (same charset as booking codes, no I/O/0/1). Uniqueness is checked
+     * against the bets table; a collision retries with a fresh code.
+     */
+    private static final SecureRandom BET_CODE_RANDOM = new SecureRandom();
+    private static final String BET_CODE_CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+    private String generateUniqueBetCode() {
+        String code;
+        int attempts = 0;
+        do {
+            var sb = new StringBuilder("GB");
+            for (int i = 0; i < 8; i++)
+                sb.append(BET_CODE_CHARSET.charAt(BET_CODE_RANDOM.nextInt(BET_CODE_CHARSET.length())));
+            code = sb.toString();
+            attempts++;
+        } while (betRepo.existsByBookingCode(code));
+        log.debug("generateUniqueBetCode: code={} attempts={}", code, attempts);
+        return code;
     }
 
     private void validateNonCorrelatedSelections(List<BetSelection> selections) {

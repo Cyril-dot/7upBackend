@@ -280,13 +280,31 @@ public class AdminMatchScheduleService {
                 adminId, matchId, kickoffAt, halfTimeAt, secondHalfAt, finishedAt,
                 req.getFinalScoreHome(), req.getFinalScoreAway(), goals.size());
 
-        // LAYER 2: persist events to DB (survives restarts)
-        persistEvents(matchId, adminId, kickoffAt, halfTimeAt, secondHalfAt, finishedAt,
-                goals, req.getFinalScoreHome(), req.getFinalScoreAway());
+        // LAYER 2: persist events to DB (survives restarts). A failure here
+        // must NEVER turn an already-created match into a 500: the client
+        // would see "failed", retry, and create duplicates while the first
+        // match sits orphaned. Log loudly and still return the match — an
+        // admin can drive it manually from the Matches tab.
+        try {
+            persistEvents(matchId, adminId, kickoffAt, halfTimeAt, secondHalfAt, finishedAt,
+                    goals, req.getFinalScoreHome(), req.getFinalScoreAway());
+        } catch (Exception e) {
+            log.error("AdminMatchScheduleService.scheduleMatch: matchId={} — event persistence FAILED, " +
+                            "match is created but the DB poller cannot drive it: {}",
+                    matchId, e.getMessage(), e);
+        }
 
-        // LAYER 1: register fast-path in-memory jobs post-commit
-        registerScheduleAfterCommit(matchId, adminId, kickoffAt, halfTimeAt, secondHalfAt,
-                finishedAt, goals, req.getFinalScoreHome(), req.getFinalScoreAway());
+        // LAYER 1: register fast-path in-memory jobs post-commit. Same rule:
+        // a registration failure must not 500 the request — the persisted
+        // DB events still drive the match via the 5s poller.
+        try {
+            registerScheduleAfterCommit(matchId, adminId, kickoffAt, halfTimeAt, secondHalfAt,
+                    finishedAt, goals, req.getFinalScoreHome(), req.getFinalScoreAway());
+        } catch (Exception e) {
+            log.error("AdminMatchScheduleService.scheduleMatch: matchId={} — in-memory registration FAILED, " +
+                            "DB poller still drives it: {}",
+                    matchId, e.getMessage(), e);
+        }
 
         return match;
     }

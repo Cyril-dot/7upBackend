@@ -12,6 +12,8 @@ import java.util.UUID;
 
 public interface BetRepository extends JpaRepository<Bet, UUID> {
 
+    boolean existsByBookingCode(String bookingCode);
+
     Page<Bet> findByUserIdOrderByPlacedAtDesc(UUID userId, Pageable pageable);
 
     Page<Bet> findByStatus(BetStatus status, Pageable pageable);
