@@ -127,6 +127,41 @@ public class AffiliateCommissionService {
         return swept;
     }
 
+    // ─── Debit exact amount (used by super-admin payout mark-paid / pay-all) ──
+
+    /**
+     * Debit exactly {@code amount} from the commission balance.
+     * Unlike {@link #sweepCommissionBalance(UUID)} this does not zero the
+     * balance — it removes only what was approved for payout.
+     *
+     * Refuses (409) when the balance no longer covers the amount, so a
+     * payout can never be confirmed twice for the same commission (e.g.
+     * after the 01:00 UTC affiliate sweep already processed it).
+     */
+    @Transactional(isolation = Isolation.SERIALIZABLE)
+    public AffiliateCommissionBalance debitCommission(UUID userId, BigDecimal amount) {
+        if (amount.compareTo(BigDecimal.ZERO) <= 0)
+            throw ApiException.badRequest("Debit amount must be positive");
+
+        var balance = commissionRepo.findByUserIdForUpdate(userId)
+                .orElseThrow(() -> ApiException.notFound("Commission balance not found for user: " + userId));
+
+        if (balance.getBalance().compareTo(amount) < 0)
+            throw ApiException.conflict("Commission balance changed since the payout was requested "
+                    + "(current " + balance.getBalance().toPlainString() + " "
+                    + balance.getCurrency() + ", requested " + amount.toPlainString()
+                    + "). Ask the super admin to request again.");
+
+        balance.setBalance(balance.getBalance().subtract(amount));
+        balance.setTotalPaidOutLifetime(balance.getTotalPaidOutLifetime().add(amount));
+        balance.setLastPayoutAt(Instant.now());
+
+        log.info("debitCommission: userId={} debited={} {} → newBalance={}",
+                userId, amount, balance.getCurrency(), balance.getBalance());
+
+        return commissionRepo.save(balance);
+    }
+
     // ─── Reversal (used when super-admin rejects a payout) ───────────────────────
 
     /**
