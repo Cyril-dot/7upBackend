@@ -1,5 +1,6 @@
 package com.speedbet.api.affiliate;
 
+import com.speedbet.api.admin.CommissionLedgerEntryRepository;
 import com.speedbet.api.audit.AuditService;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.user.UserRepository;
@@ -10,7 +11,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.*;
 
 /**
@@ -33,6 +37,7 @@ public class SuperAdminPayoutService {
     private final SuperAdminPayoutRequestRepository requestRepo;
     private final SuperAdminPayoutSettingsRepository settingsRepo;
     private final AffiliateCommissionBalanceRepository commissionRepo;
+    private final CommissionLedgerEntryRepository ledgerRepo;
     private final AffiliateCommissionService commissionService;
     private final UserRepository userRepo;
     private final AuditService auditService;
@@ -233,6 +238,66 @@ public class SuperAdminPayoutService {
         out.put("paidLifetime", paidLifetime);
         out.put("autoSettleDaily", getSettings().isAutoSettleDaily());
         out.put("currency", "GHS");
+        return out;
+    }
+
+    /**
+     * Everything the SA detail Payouts tab needs in one call, read-only.
+     * Per-day commission comes from the append-only commission ledger
+     * (one row per creditCommission event, including SA credits from
+     * ReferralService), grouped by UTC day — the same day rule the stats
+     * endpoints use. Only days with commission > 0 are returned.
+     * Lifetime figures come from the balance row; payout records are the
+     * SA's full payout-request history (open requests first in the
+     * frontend, which splits them by status).
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> payoutDetail(UUID superAdminId, int days) {
+        var sa = userRepo.findById(superAdminId)
+                .orElseThrow(() -> ApiException.notFound("Super admin not found: " + superAdminId));
+        if (sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.badRequest("User is not a super admin: " + superAdminId);
+        }
+        int window = Math.max(1, Math.min(days, 90));
+        Instant since = Instant.now().minus(Duration.ofDays(window));
+        Map<LocalDate, BigDecimal> perDay = new TreeMap<>(Comparator.reverseOrder());
+        for (var e : ledgerRepo.findByAdminIdSince(superAdminId, since)) {
+            if (e.getAmount() == null || e.getAmount().compareTo(BigDecimal.ZERO) <= 0) continue;
+            LocalDate day = LocalDate.ofInstant(e.getCreatedAt(), ZoneOffset.UTC);
+            perDay.merge(day, e.getAmount(), BigDecimal::add);
+        }
+        List<Map<String, Object>> daily = new ArrayList<>();
+        for (var entry : perDay.entrySet()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("date", entry.getKey().toString());
+            row.put("earned", entry.getValue());
+            daily.add(row);
+        }
+        var balanceRow = commissionRepo.findByUserId(superAdminId).orElse(null);
+        List<Map<String, Object>> requests = new ArrayList<>();
+        for (var r : requestRepo.findBySuperAdminIdOrderByCreatedAtDesc(superAdminId)) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", r.getId());
+            m.put("amount", r.getAmount());
+            m.put("currency", r.getCurrency());
+            m.put("status", r.getStatus().name());
+            m.put("requestedAt", r.getRequestedAt());
+            m.put("paidAt", r.getPaidAt());
+            m.put("rejectReason", r.getRejectReason());
+            m.put("createdAt", r.getCreatedAt());
+            requests.add(m);
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("superAdminId", superAdminId);
+        out.put("superAdminEmail", sa.getEmail());
+        out.put("balance", balanceRow == null ? BigDecimal.ZERO : balanceRow.getBalance());
+        out.put("currency", balanceRow == null ? "GHS" : balanceRow.getCurrency());
+        out.put("lifetimeEarned", balanceRow == null ? BigDecimal.ZERO : balanceRow.getTotalEarnedLifetime());
+        out.put("lifetimePaid", balanceRow == null ? BigDecimal.ZERO : balanceRow.getTotalPaidOutLifetime());
+        out.put("commissionRate", sa.getSuperAdminCommissionPercent());
+        out.put("days", window);
+        out.put("daily", daily);
+        out.put("requests", requests);
         return out;
     }
 

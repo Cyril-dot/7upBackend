@@ -74,6 +74,18 @@ public class SiteOwnerPayoutController {
         return ResponseEntity.ok(ApiResponse.ok(payoutService.payAll(actor.getId(), "MANUAL")));
     }
 
+    /**
+     * GET /super-admins/{id}/payout-detail?days=30 — per-day commission
+     * (ledger, UTC days, only days with commission), lifetime figures,
+     * and the SA's full payout-request history. Feeds the Payouts tab
+     * inside the SA detail card. Read-only.
+     */
+    @GetMapping("/super-admins/{id}/payout-detail")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> payoutDetail(
+            @PathVariable UUID id, @RequestParam(required = false, defaultValue = "30") int days) {
+        return ResponseEntity.ok(ApiResponse.ok(payoutService.payoutDetail(id, days)));
+    }
+
     /** GET /payout-summary — total owed, pending/approved counts, lifetime paid, auto-settle flag. */
     @GetMapping("/payout-summary")
     public ResponseEntity<ApiResponse<Map<String, Object>>> summary() {
