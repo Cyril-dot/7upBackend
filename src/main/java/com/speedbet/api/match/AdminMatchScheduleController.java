@@ -24,7 +24,7 @@ import java.util.UUID;
  * exposed for AdminMatchService.
  */
 @RestController
-@RequestMapping("/admin/matches/auto")
+@RequestMapping("/api/admin/matches/auto")
 @RequiredArgsConstructor
 @PreAuthorize("hasAnyRole('ADMIN', 'SUPER_ADMIN')")
 public class AdminMatchScheduleController {

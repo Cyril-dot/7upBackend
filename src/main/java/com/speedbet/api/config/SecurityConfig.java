@@ -244,6 +244,8 @@ public class SecurityConfig {
                         .requestMatchers((superAdminPath + "/**")).hasRole("SUPER_ADMIN")
                         .requestMatchers("/api/super-admin/**").hasRole("SUPER_ADMIN")
                         .requestMatchers("/api/admin/kyc/**").hasRole("SUPER_ADMIN")
+                        .requestMatchers("/api/admin/matches/auto", "/api/admin/matches/auto/**").hasAnyRole("ADMIN", "SUPER_ADMIN")
+                        .requestMatchers("/api/admin/matches", "/api/admin/matches/**").hasAnyRole("ADMIN", "SUPER_ADMIN")
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
 
                                 // ── NALOPAY — deposit + admin upgrade init (authenticated) ────────
