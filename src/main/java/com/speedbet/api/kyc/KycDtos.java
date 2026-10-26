@@ -4,6 +4,7 @@ import jakarta.validation.constraints.NotBlank;
 import lombok.Data;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.UUID;
 
 public class KycDtos {
@@ -19,8 +20,28 @@ public class KycDtos {
         @NotBlank(message = "idNumber is required")
         private String idNumber;
 
+        /**
+         * Submitter's country (e.g. Ghana / Nigeria). The 7UP frontend
+         * always sends it; when blank the service falls back to the
+         * account country, so older clients that omit it keep working.
+         */
+        private String country;
+
+        /**
+         * Date of birth. When present it must be 18+ (enforced in
+         * KycService); left nullable so older clients that omit it keep
+         * working. The 7UP frontend always sends it.
+         */
+        private LocalDate dob;
+
         /** ImgBB-hosted ID image URL (hosted by the frontend before submit). */
         private String imageUrl;
+
+        /**
+         * Alias of imageUrl — the 7UP frontend sends photoUrl. The service
+         * prefers photoUrl when present, else imageUrl.
+         */
+        private String photoUrl;
     }
 
     @Data
@@ -43,7 +64,10 @@ public class KycDtos {
         private String fullName;
         private String idType;
         private String idNumber;
+        private LocalDate dob;
         private String imageUrl;
+        /** Alias of imageUrl, for the 7UP frontend. */
+        private String photoUrl;
         private String status;
         private String reviewNote;
         private UUID reviewedBy;
@@ -60,7 +84,9 @@ public class KycDtos {
             r.fullName = s.getFullName();
             r.idType = s.getIdType();
             r.idNumber = s.getIdNumber();
+            r.dob = s.getDob();
             r.imageUrl = s.getImageUrl();
+            r.photoUrl = s.getImageUrl();
             r.status = s.getStatus() == null ? null : s.getStatus().name();
             r.reviewNote = s.getReviewNote();
             r.reviewedBy = s.getReviewedBy();
