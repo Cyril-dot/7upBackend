@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.UUID;
 
@@ -26,6 +27,13 @@ import java.util.UUID;
  * pending record in place; re-submitting after a REJECTED creates a fresh
  * row (the rejected history stays on file); submitting while APPROVED is
  * a conflict.
+ *
+ * 7UP extension: submit() now also stores country (falling back to the
+ * account country when the request omits it), date of birth (18+ enforced
+ * when present), and the photo link sent as photoUrl (preferred) or
+ * imageUrl (legacy). Country/dob are deliberately NOT @NotBlank/@NotNull
+ * in the DTO: older clients that omit them must keep working on this
+ * shared backend; the 7UP frontend always sends them.
  */
 @Service
 @RequiredArgsConstructor
@@ -61,6 +69,11 @@ public class KycService {
             throw ApiException.conflict("Your identity is already verified.");
         }
 
+        // 7UP: date of birth must be 18+ whenever the client sends one.
+        if (req.getDob() != null && req.getDob().isAfter(LocalDate.now().minusYears(18))) {
+            throw ApiException.badRequest("You must be 18 or older.");
+        }
+
         String displayName = ((user.getFirstName() == null ? "" : user.getFirstName()) + " "
                 + (user.getLastName() == null ? "" : user.getLastName())).trim();
         if (displayName.isEmpty()) displayName = user.getEmail();
@@ -73,11 +86,15 @@ public class KycService {
         }
         target.setEmail(user.getEmail());
         target.setUserName(displayName);
-        target.setCountry(user.getCountry());
+        target.setCountry(req.getCountry() != null && !req.getCountry().isBlank()
+                ? req.getCountry().trim() : user.getCountry());
         target.setFullName(req.getFullName().trim());
         target.setIdType(req.getIdType().trim());
         target.setIdNumber(req.getIdNumber().trim());
-        target.setImageUrl(req.getImageUrl());
+        target.setDob(req.getDob());
+        String image = req.getPhotoUrl() != null && !req.getPhotoUrl().isBlank()
+                ? req.getPhotoUrl().trim() : req.getImageUrl();
+        target.setImageUrl(image);
         target.setStatus(KycStatus.PENDING);
         target.setReviewNote(null);
         target.setReviewedBy(null);

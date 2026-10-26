@@ -4,6 +4,7 @@ import jakarta.persistence.*;
 import lombok.*;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.UUID;
 
 /**
@@ -14,6 +15,11 @@ import java.util.UUID;
  * ANY user's device. The ID image itself is NOT stored here — the
  * frontend hosts it on ImgBB first and sends only the link (imageUrl),
  * keeping this table light.
+ *
+ * 7UP extension: date_of_birth was added for the 7UP ID verification
+ * flow (the 7UP frontend always sends country + dob + photoUrl).
+ * Schema: spring.jpa.hibernate.ddl-auto=update, so the column is created
+ * automatically — no Flyway migration needed (flyway is disabled).
  */
 @Entity
 @Table(name = "kyc_submissions", indexes = {
@@ -49,6 +55,10 @@ public class KycSubmission {
 
     @Column(name = "id_number", nullable = false)
     private String idNumber;
+
+    /** Date of birth — 18+ enforced in KycService when present. */
+    @Column(name = "date_of_birth")
+    private LocalDate dob;
 
     /** ImgBB-hosted ID image URL — a link, never the image bytes. */
     @Column(name = "image_url", columnDefinition = "TEXT")
