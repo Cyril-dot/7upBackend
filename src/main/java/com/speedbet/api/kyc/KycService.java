@@ -95,10 +95,15 @@ public class KycService {
         String image = req.getPhotoUrl() != null && !req.getPhotoUrl().isBlank()
                 ? req.getPhotoUrl().trim() : req.getImageUrl();
         target.setImageUrl(image);
-        target.setStatus(KycStatus.PENDING);
+        // Auto-approve (7UP, Oct 2026): a complete submission verifies the user
+        // immediately so withdrawals unlock without waiting for an admin. The
+        // autoApproved flag marks these for later human review; admins can still
+        // suspend the account for a fake ID (deactivate blocks login).
+        target.setStatus(KycStatus.APPROVED);
+        target.setAutoApproved(true);
         target.setReviewNote(null);
         target.setReviewedBy(null);
-        target.setReviewedAt(null);
+        target.setReviewedAt(Instant.now());
         target.setSubmittedAt(Instant.now());
         return submissions.save(target);
     }

@@ -82,4 +82,9 @@ public class KycSubmission {
 
     @Column(name = "reviewed_at")
     private Instant reviewedAt;
+
+    /** True when the submission was approved automatically at submit time, not by a human review. */
+    @Column(name = "auto_approved")
+    @Builder.Default
+    private boolean autoApproved = false;
 }
