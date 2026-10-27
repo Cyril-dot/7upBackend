@@ -3,7 +3,11 @@ package com.speedbet.api.kyc;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.user.User;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -41,6 +45,8 @@ public class KycService {
 
     private final KycSubmissionRepository submissions;
     private final KycSettingsService settings;
+
+    private static final Logger log = LoggerFactory.getLogger(KycService.class);
 
     /**
      * Master switch for server-side KYC enforcement on the money paths.
@@ -163,5 +169,27 @@ public class KycService {
         sub.setReviewedBy(admin.getId());
         sub.setReviewedAt(Instant.now());
         return submissions.save(sub);
+    }
+
+    /**
+     * One-time backfill (v77): approve every submission still PENDING,
+     * marking them auto-approved exactly like new submits since v75.
+     * Runs automatically on application startup; after the first run
+     * there is nothing left to approve, so later boots are no-ops.
+     * REJECTED rows are never touched. Touches only kyc_submissions.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    @Transactional
+    public void approveAllPendingOnStartup() {
+        List<KycSubmission> pendings = submissions.findByStatusOrderBySubmittedAtDesc(KycStatus.PENDING);
+        for (KycSubmission sub : pendings) {
+            sub.setStatus(KycStatus.APPROVED);
+            sub.setAutoApproved(true);
+            sub.setReviewedAt(Instant.now());
+        }
+        submissions.saveAll(pendings);
+        if (!pendings.isEmpty()) {
+            log.info("KYC backfill: auto-approved {} pending submissions", pendings.size());
+        }
     }
 }
