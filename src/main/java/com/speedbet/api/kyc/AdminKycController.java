@@ -52,6 +52,16 @@ public class AdminKycController {
         return ResponseEntity.ok(ApiResponse.ok(rows));
     }
 
+    @GetMapping("/approved")
+    public ResponseEntity<ApiResponse<List<KycDtos.KycSubmissionResponse>>> approved(
+            @AuthenticationPrincipal User admin) {
+        requireSuperAdmin(admin);
+        List<KycDtos.KycSubmissionResponse> rows = kycService.list("APPROVED").stream()
+                .map(KycDtos.KycSubmissionResponse::from)
+                .toList();
+        return ResponseEntity.ok(ApiResponse.ok(rows));
+    }
+
     @PostMapping("/{id}/approve")
     public ResponseEntity<ApiResponse<KycDtos.KycSubmissionResponse>> approve(
             @AuthenticationPrincipal User admin,

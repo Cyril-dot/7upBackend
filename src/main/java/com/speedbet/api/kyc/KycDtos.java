@@ -73,6 +73,7 @@ public class KycDtos {
         private UUID reviewedBy;
         private Instant submittedAt;
         private Instant reviewedAt;
+        private boolean autoApproved;
 
         public static KycSubmissionResponse from(KycSubmission s) {
             KycSubmissionResponse r = new KycSubmissionResponse();
@@ -92,6 +93,7 @@ public class KycDtos {
             r.reviewedBy = s.getReviewedBy();
             r.submittedAt = s.getSubmittedAt();
             r.reviewedAt = s.getReviewedAt();
+            r.autoApproved = s.isAutoApproved();
             return r;
         }
     }
