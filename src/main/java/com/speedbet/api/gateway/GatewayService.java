@@ -113,6 +113,25 @@ public class GatewayService {
         return Optional.empty();
     }
 
+    /**
+     * Nigeria manual bank details for a branch setting, or null when the
+     * super admin has not set all three. The deposit page hides the manual
+     * option on null — a half-set bank detail is never shown to users.
+     */
+    public static Map<String, Object> ngManualBankRow(BranchGatewaySetting s) {
+        if (s == null
+                || s.getNgManualBankName() == null || s.getNgManualBankName().isBlank()
+                || s.getNgManualAccountNumber() == null || s.getNgManualAccountNumber().isBlank()
+                || s.getNgManualAccountName() == null || s.getNgManualAccountName().isBlank()) {
+            return null;
+        }
+        var row = new LinkedHashMap<String, Object>();
+        row.put("bankName", s.getNgManualBankName());
+        row.put("accountNumber", s.getNgManualAccountNumber());
+        row.put("accountName", s.getNgManualAccountName());
+        return row;
+    }
+
     /** Active gateways for a user: their branch's setting, or the platform defaults. */
     public Map<String, Object> activeFor(User user) {
         var saId = resolveBranchSuperAdmin(user);
@@ -121,12 +140,14 @@ public class GatewayService {
         if (saId.isEmpty()) {
             out.put("ghGateway", DEFAULT_GH);
             out.put("ngGateway", DEFAULT_NG);
+            out.put("ngManualBank", null);
             out.put("isBranchDefault", true);
             return out;
         }
         var setting = settingRepo.findBySuperAdminId(saId.get()).orElse(null);
         out.put("ghGateway", setting == null ? DEFAULT_GH : setting.getGhGateway());
         out.put("ngGateway", setting == null ? DEFAULT_NG : setting.getNgGateway());
+        out.put("ngManualBank", ngManualBankRow(setting));
         out.put("isBranchDefault", setting == null);
         return out;
     }
@@ -136,9 +157,51 @@ public class GatewayService {
         row.put("superAdminId", s.getSuperAdminId().toString());
         row.put("ghGateway", s.getGhGateway());
         row.put("ngGateway", s.getNgGateway());
+        row.put("ngManualBank", ngManualBankRow(s));
         row.put("updatedBy", s.getUpdatedBy() == null ? null : s.getUpdatedBy().toString());
         row.put("updatedAt", s.getUpdatedAt() == null ? null : s.getUpdatedAt().toString());
         return row;
+    }
+
+    // ─── Super admin sets their own Nigeria manual bank details ──────────
+
+    /**
+     * Direct super-admin write — deliberately NOT the gateway-request flow.
+     * The gateway choices (ghGateway/ngGateway) stay owner-set only, but
+     * these bank details are the super admin's OWN receiving account for
+     * manual Nigerian deposits, so the super admin sets them directly and
+     * they go live immediately. Plain ADMINs and the site owner are refused
+     * here (the owner uses the owner endpoints, never a branch's details).
+     * Ghana is untouched: this writes Nigeria manual details only.
+     */
+    @Transactional
+    public Map<String, Object> setNgManualBank(User sa, String bankName, String accountNumber, String accountName) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can set manual bank details for their branch.");
+        }
+        var bank = bankName == null ? "" : bankName.trim();
+        var accNo = accountNumber == null ? "" : accountNumber.trim();
+        var accName = accountName == null ? "" : accountName.trim();
+        if (bank.isEmpty() || accNo.isEmpty() || accName.isEmpty()) {
+            throw ApiException.badRequest("Bank name, account number and account name are all required.");
+        }
+        if (bank.length() > 100 || accNo.length() > 50 || accName.length() > 100) {
+            throw ApiException.badRequest("Bank details are too long (bank name / account name max 100, account number max 50).");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId())
+                .orElseGet(() -> BranchGatewaySetting.builder()
+                        .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
+        var before = ngManualBankRow(setting);
+        setting.setNgManualBankName(bank);
+        setting.setNgManualAccountNumber(accNo);
+        setting.setNgManualAccountName(accName);
+        setting.setUpdatedBy(sa.getId());
+        setting.setUpdatedAt(Instant.now());
+        var saved = settingRepo.save(setting);
+        auditService.log(sa.getId(), "SET_NG_MANUAL_BANK", "branch_gateway_settings", saved.getId(),
+                before == null ? null : Map.of("ngManualBank", before),
+                Map.of("ngManualBank", ngManualBankRow(saved)), null);
+        return ngManualBankRow(saved);
     }
 
     public Map<String, Object> requestRowOrNull(UUID superAdminId) {
