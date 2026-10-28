@@ -41,6 +41,25 @@ public class BranchGatewaySetting {
     @Builder.Default
     private String ngGateway = "GMP";
 
+    /**
+     * Nigeria MANUAL bank details, set directly by the branch's super admin
+     * (see GatewayService.setNgManualBank). These are the super admin's OWN
+     * receiving bank details, shown to Nigerian users as the manual bank
+     * transfer option on the deposit page — they are NOT a platform gateway
+     * choice, so unlike ghGateway/ngGateway they need no site-owner approval.
+     * All three are null when the super admin has not set them, and the
+     * manual option is hidden from users until all three are present.
+     * Nullable columns only, so ddl-auto=update adds them safely.
+     */
+    @Column(name = "ng_manual_bank_name", length = 100)
+    private String ngManualBankName;
+
+    @Column(name = "ng_manual_account_number", length = 50)
+    private String ngManualAccountNumber;
+
+    @Column(name = "ng_manual_account_name", length = 100)
+    private String ngManualAccountName;
+
     /** The site owner who last set this row. */
     @Column(name = "updated_by")
     private UUID updatedBy;

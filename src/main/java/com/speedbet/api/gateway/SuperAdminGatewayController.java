@@ -59,4 +59,24 @@ public class SuperAdminGatewayController {
         return ResponseEntity.ok(ApiResponse.ok(gatewayService.requestRow(saved),
                 "Gateway request sent to the site owner. Your current gateways stay live until the owner sets them."));
     }
+
+    /**
+     * Direct set of the branch's Nigeria MANUAL bank details (bank name,
+     * account number, account name). Unlike the gateway request above, this
+     * is NOT owner-approved: the details are the super admin's own receiving
+     * account, and they go live on the Nigerian deposit page immediately.
+     * Plain ADMINs and the site owner are refused by requireSuperAdmin.
+     */
+    @PutMapping("/ng-manual-bank")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setNgManualBank(
+            @AuthenticationPrincipal User actor,
+            @RequestBody Map<String, String> req) {
+        requireSuperAdmin(actor);
+        var saved = gatewayService.setNgManualBank(actor,
+                req.get("bankName"), req.get("accountNumber"), req.get("accountName"));
+        var out = new LinkedHashMap<String, Object>();
+        out.put("ngManualBank", saved);
+        return ResponseEntity.ok(ApiResponse.ok(out,
+                "Nigeria manual bank details saved. Nigerian users on your branch now see them as the manual bank transfer option."));
+    }
 }
