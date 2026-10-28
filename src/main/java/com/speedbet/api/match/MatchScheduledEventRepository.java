@@ -49,6 +49,22 @@ public interface MatchScheduledEventRepository extends JpaRepository<MatchSchedu
            "WHERE e.id = :id AND e.status = 'PENDING'")
     int claimEvent(@Param("id") UUID id);
 
+    // ── Orphan recovery ─────────────────────────────────────────────────
+
+    /**
+     * Resets events stuck in CLAIMED long after their fire_at back to
+     * PENDING so the poller retries them. A claim is transient (execution
+     * takes seconds), so anything still CLAIMED 10+ minutes past fire_at
+     * is orphaned by a restart, not work in flight. Without this, an
+     * orphaned KICKOFF event is invisible to the poller forever and its
+     * match can hang in SCHEDULED past its end.
+     */
+    @Modifying
+    @Transactional
+    @Query("UPDATE MatchScheduledEvent e SET e.status = 'PENDING' " +
+           "WHERE e.status = 'CLAIMED' AND e.fireAt <= :cutoff")
+    int resetStaleClaimed(@Param("cutoff") Instant cutoff);
+
     // ── Mark terminal states ────────────────────────────────────────────
 
     @Modifying

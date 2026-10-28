@@ -703,10 +703,13 @@ public class AdminMatchScheduleService {
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Finds admin-created matches that are still LIVE / HALF_TIME / SECOND_HALF
-     * but whose scheduled end time has already passed. These are matches with no
-     * in-memory handle whose DB events were not picked up by the poller.
-     * Calls forceFinish() on each one as an absolute final backstop.
+     * Finds admin-created matches that are still SCHEDULED / LIVE / HALF_TIME /
+     * SECOND_HALF but whose scheduled end time has already passed. These are
+     * matches with no in-memory handle whose DB events were not picked up by
+     * the poller. SCHEDULED is included on purpose: a match whose KICKOFF
+     * event was lost (e.g. claimed then orphaned by a restart) must still end
+     * rather than hang in SCHEDULED past its window. Calls forceFinish() on
+     * each one as an absolute final backstop.
      */
     @Scheduled(fixedDelay = 30_000, initialDelay = 60_000)
     @Transactional
@@ -717,7 +720,7 @@ public class AdminMatchScheduleService {
         List<Match> overdue = matchRepository
                 .findBySourceAndStatusInAndKickoffAtLessThanEqual(
                         MatchSource.ADMIN_CREATED,
-                        List.of("LIVE", "HALF_TIME", "SECOND_HALF"),
+                        List.of("SCHEDULED", "LIVE", "HALF_TIME", "SECOND_HALF"),
                         cutoff);
 
         if (overdue.isEmpty()) return;
@@ -753,6 +756,35 @@ public class AdminMatchScheduleService {
                 log.error("AdminMatchScheduleService.overdueFinishSweep: matchId={} FAILED — {}",
                         matchId, e.getMessage(), e);
             }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // LAYER 3b2 — STALE CLAIMED EVENT RESET (every 60s, DB-sourced)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * The 5-second poller claims an event (PENDING → CLAIMED) and then
+     * executes it, but it only ever reads PENDING rows. If the process
+     * restarts between the claim and the DONE/FAILED mark, that event stays
+     * CLAIMED forever and is never retried — a lost KICKOFF event can leave
+     * its match stranded in SCHEDULED.
+     *
+     * Execution takes seconds, so any event still CLAIMED 10 minutes after
+     * its fire_at is an orphan, not work in flight. Resetting it to PENDING
+     * lets the poller execute it on the next pass. advanceStatusTo and
+     * forceFinish are forward-only / idempotent, so a double execution
+     * after a genuine (not orphaned) claim is harmless.
+     */
+    @Scheduled(fixedDelay = 60_000, initialDelay = 30_000)
+    @Transactional
+    public void resetStaleClaimedEvents() {
+        Instant cutoff = Instant.now().minus(10, ChronoUnit.MINUTES);
+        int reset = eventRepository.resetStaleClaimed(cutoff);
+        if (reset > 0) {
+            log.warn("AdminMatchScheduleService.resetStaleClaimedEvents: " +
+                            "reset {} orphaned CLAIMED event(s) to PENDING",
+                    reset);
         }
     }
 
