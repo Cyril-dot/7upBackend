@@ -1,5 +1,7 @@
 package com.speedbet.api.match;
 
+import com.speedbet.api.bet.SettlementEngine;
+import com.speedbet.api.common.ApiException;
 import com.speedbet.api.match.Match;
 import com.speedbet.api.user.User;
 import jakarta.validation.Valid;
@@ -11,7 +13,9 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -31,6 +35,7 @@ import java.util.UUID;
  *   GET    /{id}              — get one of MY matches
  *   PATCH  /{id}/status       — transition status (MY match only)
  *   PATCH  /{id}/score        — update live score (MY match only, non-FINISHED)
+ *   POST   /{id}/settle       — settle a FINISHED match's bets on demand (MY match only)
  */
 @Slf4j
 @RestController
@@ -40,6 +45,8 @@ import java.util.UUID;
 public class AdminMatchController {
 
     private final AdminMatchService adminMatchService;
+    private final SettlementEngine settlementEngine;
+    private final MatchService matchService;
 
     // ── Create ────────────────────────────────────────────────────────────
 
@@ -106,5 +113,45 @@ public class AdminMatchController {
         log.info("Admin[{}]: updateScore matchId={} {}:{} minute={}",
                 admin.getId(), id, req.getScoreHome(), req.getScoreAway(), req.getMinutePlayed());
         return ResponseEntity.ok(adminMatchService.updateScore(id, req, admin));
+    }
+
+    // ── Manual settlement ────────────────────────────────────────────────
+
+    /**
+     * Settles a finished match's bets on demand — the same engine pass the
+     * 60s scheduler runs, followed by the mark-settled + late-bet second pass.
+     * Returns 400 if the match is not FINISHED or has no final score recorded.
+     * Returns 404 if the match doesn't exist or belongs to another admin.
+     * Re-running on an already-settled match is a harmless no-op (no pending
+     * bets remain, so the tally comes back zero).
+     */
+    @PostMapping("/{id}/settle")
+    public ResponseEntity<Map<String, Object>> settleMatch(
+            @PathVariable UUID id,
+            @AuthenticationPrincipal User admin) {
+
+        Match match = adminMatchService.getMyMatch(id, admin.getId());
+        if (!"FINISHED".equals(match.getStatus())) {
+            throw ApiException.badRequest("Match is not finished yet");
+        }
+        if (match.getScoreHome() == null || match.getScoreAway() == null) {
+            throw ApiException.badRequest("Match has no final score recorded — cannot settle");
+        }
+        log.info("Admin[{}]: settleMatch matchId={} score={}:{}",
+                admin.getId(), id, match.getScoreHome(), match.getScoreAway());
+        SettlementEngine.Tally tally = settlementEngine.settleMatch(match);
+        matchService.markSettled(id.toString());
+        SettlementEngine.Tally lateTally = settlementEngine.settleMatch(match);
+        log.info("Admin[{}]: settleMatch matchId={} done — {} + late {}",
+                admin.getId(), id, tally, lateTally);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("won", tally.won + lateTally.won);
+        result.put("lost", tally.lost + lateTally.lost);
+        result.put("voided", tally.voided + lateTally.voided);
+        result.put("deferred", tally.deferred + lateTally.deferred);
+        result.put("skipped", tally.skipped + lateTally.skipped);
+        result.put("failed", tally.failed + lateTally.failed);
+        result.put("settled", true);
+        return ResponseEntity.ok(result);
     }
 }
