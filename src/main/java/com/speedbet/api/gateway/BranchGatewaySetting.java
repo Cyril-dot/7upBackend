@@ -3,6 +3,7 @@ package com.speedbet.api.gateway;
 import jakarta.persistence.*;
 import lombok.*;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -79,6 +80,28 @@ public class BranchGatewaySetting {
 
     @Column(name = "gh_akwapay_webhook_secret", length = 500)
     private String ghAkwapayWebhookSecret;
+
+    // ── Branch platform settings: per-branch limits (optional) ────────
+    // Null = platform default. The super admin sets these from their
+    // Settings tab; the deposit page, betslip and withdrawal page all
+    // read the EFFECTIVE values (branch value, else platform default).
+    @Column(name = "gh_min_deposit")
+    private BigDecimal ghMinDeposit;
+
+    @Column(name = "ng_min_deposit")
+    private BigDecimal ngMinDeposit;
+
+    @Column(name = "gh_min_stake")
+    private BigDecimal ghMinStake;
+
+    @Column(name = "ng_min_stake")
+    private BigDecimal ngMinStake;
+
+    @Column(name = "gh_min_withdrawal")
+    private BigDecimal ghMinWithdrawal;
+
+    @Column(name = "ng_min_withdrawal")
+    private BigDecimal ngMinWithdrawal;
 
     /** The site owner who last set this row. */
     @Column(name = "updated_by")

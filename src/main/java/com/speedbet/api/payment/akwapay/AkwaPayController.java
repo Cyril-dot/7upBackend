@@ -198,14 +198,30 @@ public class AkwaPayController {
 
     // ─── Deposit Init ─────────────────────────────────────────────────────────
 
+        // Branch-effective Ghana deposit minimum: the branch super admin's
+    // setting, else the platform env default. Falls back to minDeposit
+    // if the branch lookup fails, so a gateway hiccup can never block
+    // deposits.
+    private BigDecimal branchGhMinDeposit(User user) {
+        try {
+            var v = gatewayService.branchLimitsFor(user).get("ghMinDeposit");
+            if (v instanceof BigDecimal bd) return bd;
+            if (v != null) return new BigDecimal(v.toString());
+        } catch (Exception e) {
+            log.warn("branchGhMinDeposit: falling back to platform minimum");
+        }
+        return minDeposit;
+    }
+
     @PostMapping("/api/wallet/deposit/akwapay/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initDeposit(
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
         var amount = new BigDecimal(req.get("amount").toString());
-        if (amount.compareTo(minDeposit) < 0)
-            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        var effMin = branchGhMinDeposit(user);
+        if (amount.compareTo(effMin) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + effMin.stripTrailingZeros().toPlainString());
 
         var amountPesewas = amount
                 .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
@@ -258,8 +274,9 @@ public class AkwaPayController {
             @RequestBody Map<String, Object> req) {
 
         var amount = new BigDecimal(req.get("amount").toString());
-        if (amount.compareTo(minDeposit) < 0)
-            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        var effMin = branchGhMinDeposit(user);
+        if (amount.compareTo(effMin) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + effMin.stripTrailingZeros().toPlainString());
 
         var phone = req.get("phone") == null ? null : req.get("phone").toString();
         if (phone == null || phone.isBlank())
