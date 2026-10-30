@@ -193,7 +193,7 @@ public class AkwaPayController {
     @Value("${app.akwapay.secret-key}")              private String     secretKey;
     @Value("${app.akwapay.webhook-secret}")          private String     webhookSecret;
     @Value("${app.akwapay.base-url}")                private String     baseUrl;
-    @Value("${app.platform.min-deposit-amount:300}") private BigDecimal minDeposit;
+    @Value("${app.platform.min-deposit-amount:20}") private BigDecimal minDeposit;
     @Value("${app.platform.frontend-url}")           private String     frontendUrl;
 
     // ─── Deposit Init ─────────────────────────────────────────────────────────
