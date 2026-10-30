@@ -14,10 +14,12 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Super admin side of the gateway workflow: the admin DECIDES.
- * This controller can only ever create a PENDING request — it has
- * no endpoint that changes the branch's active gateways. The site
- * owner sets them (see SiteOwnerGatewayController).
+ * Super admin side of the gateway workflow: the admin sets their OWN
+ * branch gateways directly (Ghana AkwaPay, Nigeria manual bank transfer)
+ * via /direct below — no site-owner approval. The legacy /request
+ * endpoint still creates a PENDING request for the owner to approve or
+ * reject, and the owner can still override any branch directly (see
+ * SiteOwnerGatewayController).
  */
 @RestController
 @RequestMapping("/api/super-admin/gateway")
@@ -32,7 +34,7 @@ public class SuperAdminGatewayController {
         // the owner must use the owner endpoints, never request for a
         // branch as if they were its super admin.
         if (actor == null || actor.getRole() != UserRole.SUPER_ADMIN) {
-            throw ApiException.forbidden("Only a super admin can request gateways for their branch. The site owner sets them.");
+            throw ApiException.forbidden("Only a super admin can manage gateways for their branch.");
         }
     }
 
@@ -58,6 +60,22 @@ public class SuperAdminGatewayController {
         var saved = gatewayService.requestGateway(actor, req.get("ghGateway"), req.get("ngGateway"));
         return ResponseEntity.ok(ApiResponse.ok(gatewayService.requestRow(saved),
                 "Gateway request sent to the site owner. Your current gateways stay live until the owner sets them."));
+    }
+
+    /**
+     * Direct set of the branch's OWN gateways — Ghana AkwaPay and/or
+     * Nigeria manual bank transfer. Goes live immediately for every user
+     * on this super admin's branch. Plain ADMINs and the site owner are
+     * refused by requireSuperAdmin.
+     */
+    @PutMapping("/direct")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setOwnGateways(
+            @AuthenticationPrincipal User actor,
+            @RequestBody Map<String, String> req) {
+        requireSuperAdmin(actor);
+        var saved = gatewayService.setOwnGateways(actor, req.get("ghGateway"), req.get("ngGateway"));
+        return ResponseEntity.ok(ApiResponse.ok(saved,
+                "Branch gateways saved. They are live now for users on your branch."));
     }
 
     /**
