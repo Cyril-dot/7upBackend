@@ -48,7 +48,7 @@ public class GatewayService {
     public static final String DEFAULT_NG = "GMP";
 
     public static final Set<String> ALLOWED_GH = Set.of("AKWAPAY", "GMP");
-    public static final Set<String> ALLOWED_NG = Set.of("GMP", "KORAPAY");
+    public static final Set<String> ALLOWED_NG = Set.of("GMP", "KORAPAY", "MANUAL");
 
     private final BranchGatewaySettingRepository settingRepo;
     private final GatewayRequestRepository requestRepo;
@@ -167,12 +167,13 @@ public class GatewayService {
 
     /**
      * Direct super-admin write — deliberately NOT the gateway-request flow.
-     * The gateway choices (ghGateway/ngGateway) stay owner-set only, but
-     * these bank details are the super admin's OWN receiving account for
+     * These bank details are the super admin's OWN receiving account for
      * manual Nigerian deposits, so the super admin sets them directly and
-     * they go live immediately. Plain ADMINs and the site owner are refused
-     * here (the owner uses the owner endpoints, never a branch's details).
-     * Ghana is untouched: this writes Nigeria manual details only.
+     * they go live immediately. Saving details also flips the branch's
+     * Nigeria gateway to MANUAL (checkout is no longer offered to Nigerian
+     * users, so the stored gateway must say so). Plain ADMINs and the site
+     * owner are refused here (the owner uses the owner endpoints, never a
+     * branch's details).
      */
     @Transactional
     public Map<String, Object> setNgManualBank(User sa, String bankName, String accountNumber, String accountName) {
@@ -192,15 +193,17 @@ public class GatewayService {
                 .orElseGet(() -> BranchGatewaySetting.builder()
                         .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
         var before = ngManualBankRow(setting);
+        var beforeNg = setting.getNgGateway();
         setting.setNgManualBankName(bank);
         setting.setNgManualAccountNumber(accNo);
         setting.setNgManualAccountName(accName);
+        setting.setNgGateway("MANUAL");
         setting.setUpdatedBy(sa.getId());
         setting.setUpdatedAt(Instant.now());
         var saved = settingRepo.save(setting);
         auditService.log(sa.getId(), "SET_NG_MANUAL_BANK", "branch_gateway_settings", saved.getId(),
-                before == null ? null : Map.of("ngManualBank", before),
-                Map.of("ngManualBank", ngManualBankRow(saved)), null);
+                before == null ? null : Map.of("ngManualBank", before, "ngGateway", beforeNg),
+                Map.of("ngManualBank", ngManualBankRow(saved), "ngGateway", "MANUAL"), null);
         return ngManualBankRow(saved);
     }
 
@@ -324,5 +327,53 @@ public class GatewayService {
         supersedePending(owner, saId);
         var setting = applySetting(owner, saId, ghV, ngV, before);
         return settingRow(setting);
+    }
+
+    // ─── Super admin sets their OWN branch gateways ─────────────────────
+
+    /**
+     * Direct super-admin write of their OWN branch's gateways — no site
+     * owner approval. Ghana is AkwaPay only (the only Ghana gateway the
+     * deposit page offers); Nigeria is MANUAL only (manual bank transfer
+     * is the only Nigeria method the deposit page offers since checkout
+     * was removed). At least one side must be supplied; the other side
+     * keeps its current value. A pending gateway request is left alone:
+     * the owner can still approve/reject it, and an approval would then
+     * overwrite this direct set — the owner remains the final override.
+     */
+    @Transactional
+    public Map<String, Object> setOwnGateways(User sa, String gh, String ng) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can set gateways for their branch.");
+        }
+        String ghV = null, ngV = null;
+        if (gh != null && !gh.isBlank()) {
+            ghV = gh.trim().toUpperCase();
+            if (!"AKWAPAY".equals(ghV)) {
+                throw ApiException.badRequest("Ghana gateway is AkwaPay.");
+            }
+        }
+        if (ng != null && !ng.isBlank()) {
+            ngV = ng.trim().toUpperCase();
+            if (!"MANUAL".equals(ngV)) {
+                throw ApiException.badRequest("Nigeria gateway is manual bank transfer.");
+            }
+        }
+        if (ghV == null && ngV == null) {
+            throw ApiException.badRequest("Set at least one gateway (ghGateway or ngGateway).");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId())
+                .orElseGet(() -> BranchGatewaySetting.builder()
+                        .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
+        var before = settingRow(setting);
+        if (ghV != null) setting.setGhGateway(ghV);
+        if (ngV != null) setting.setNgGateway(ngV);
+        setting.setUpdatedBy(sa.getId());
+        setting.setUpdatedAt(Instant.now());
+        var saved = settingRepo.save(setting);
+        auditService.log(sa.getId(), "SET_OWN_GATEWAYS", "branch_gateway_settings", saved.getId(),
+                Map.of("ghGateway", before.get("ghGateway"), "ngGateway", before.get("ngGateway")),
+                Map.of("ghGateway", saved.getGhGateway(), "ngGateway", saved.getNgGateway()), null);
+        return settingRow(saved);
     }
 }
