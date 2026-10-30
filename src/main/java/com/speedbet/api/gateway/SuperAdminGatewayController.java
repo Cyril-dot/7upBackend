@@ -107,6 +107,30 @@ public class SuperAdminGatewayController {
      * account, and they go live on the Nigerian deposit page immediately.
      * Plain ADMINs and the site owner are refused by requireSuperAdmin.
      */
+    /**
+     * Branch platform settings: the limits this super admin's users
+     * actually face. "set" is what the branch saved (null = default),
+     * "effective" is what users see, "defaults" is the platform set.
+     */
+    @GetMapping("/branch-settings")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getBranchSettings(
+            @AuthenticationPrincipal User actor) {
+        requireSuperAdmin(actor);
+        return ResponseEntity.ok(ApiResponse.ok(gatewayService.branchSettingsForSa(actor.getId())));
+    }
+
+    @PutMapping("/branch-settings")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setBranchSettings(
+            @AuthenticationPrincipal User actor,
+            @RequestBody Map<String, Object> req) {
+        requireSuperAdmin(actor);
+        boolean clear = Boolean.TRUE.equals(req.get("clear"));
+        var saved = gatewayService.setBranchLimits(actor, req, clear);
+        return ResponseEntity.ok(ApiResponse.ok(saved,
+                clear ? "Branch limits reset to platform defaults. They are live now for users on your branch."
+                        : "Branch limits saved. They are live now for users on your branch."));
+    }
+
     @PutMapping("/ng-manual-bank")
     public ResponseEntity<ApiResponse<Map<String, Object>>> setNgManualBank(
             @AuthenticationPrincipal User actor,

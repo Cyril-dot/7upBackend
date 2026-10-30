@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.speedbet.api.common.ApiException;
+import com.speedbet.api.gateway.GatewayService;
 import com.speedbet.api.referral.ReferralService;
 import com.speedbet.api.user.UserRepository;
 
@@ -22,6 +23,7 @@ public class BankDepositService {
     private final WalletService         walletService;
     private final ReferralService       referralService;
     private final UserRepository        userRepository;
+    private final GatewayService        gatewayService;
     private static final java.math.BigDecimal MOMO_MAX_AMOUNT = new java.math.BigDecimal("30000.00");
 
     // ── User: own history ─────────────────────────────────────────────────────
@@ -72,6 +74,22 @@ public class BankDepositService {
         if (repo.existsByTransferReference(req.getTransferReference())) {
             throw ApiException.conflict(
                     "A deposit with this transfer reference was already submitted.");
+        }
+        // Branch Nigeria minimum: the branch super admin's setting, else
+        // the platform ₦10,000. Enforced here as well as on the page, so
+        // a direct API submit cannot slip under the branch's floor.
+        var ngnSent = req.getNgnAmountSent();
+        if (ngnSent != null) {
+            var effNgMin = new java.math.BigDecimal("10000");
+            var u = userRepository.findById(userId).orElse(null);
+            if (u != null) {
+                var v = gatewayService.branchLimitsFor(u).get("ngMinDeposit");
+                if (v instanceof java.math.BigDecimal bd) effNgMin = bd;
+            }
+            if (ngnSent.compareTo(effNgMin) < 0) {
+                throw ApiException.badRequest("Minimum manual deposit is ₦"
+                        + java.text.NumberFormat.getInstance(java.util.Locale.US).format(effNgMin));
+            }
         }
         BankDeposit deposit = BankDeposit.builder()
                 .userId(userId)

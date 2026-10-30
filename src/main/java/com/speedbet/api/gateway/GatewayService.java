@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -48,6 +49,12 @@ public class GatewayService {
     public static final String DEFAULT_GH = "AKWAPAY";
     public static final String DEFAULT_NG = "GMP";
 
+    public static final BigDecimal DEFAULT_NG_DEPOSIT = new BigDecimal("10000");
+    public static final BigDecimal DEFAULT_GH_STAKE = new BigDecimal("150");
+    public static final BigDecimal DEFAULT_NG_STAKE = new BigDecimal("15000");
+    public static final BigDecimal DEFAULT_GH_WITHDRAWAL = new BigDecimal("2000");
+    public static final BigDecimal DEFAULT_NG_WITHDRAWAL = new BigDecimal("200000");
+
     public static final Set<String> ALLOWED_GH = Set.of("AKWAPAY", "GMP");
     public static final Set<String> ALLOWED_NG = Set.of("GMP", "KORAPAY", "MANUAL");
 
@@ -65,6 +72,12 @@ public class GatewayService {
     // platform key, so a missing env var can never leak or break.
     @Value("${GATEWAY_KEY_SECRET:}")
     private String gatewayKeySecret;
+
+    // Platform Ghana deposit minimum (Railway env override, same
+    // variable the AkwaPay controller falls back to). Used as the
+    // Ghana deposit default for branches with no saved setting.
+    @Value("${app.platform.min-deposit-amount:20}")
+    private BigDecimal platformMinDepositGh;
 
     // ─── Validation ────────────────────────────────────────────────────
 
@@ -510,5 +523,136 @@ public class GatewayService {
                 Map.of("ghGateway", before.get("ghGateway"), "ngGateway", before.get("ngGateway")),
                 Map.of("ghGateway", saved.getGhGateway(), "ngGateway", saved.getNgGateway()), null);
         return settingRow(saved);
+    }
+
+    // ─── Branch platform settings: per-branch limits ─────────────────
+    // One row per branch already exists for gateways, so limits live
+    // there too: null means "platform default", never "no limit".
+    // The deposit page, betslip and withdrawal page read EFFECTIVE
+    // values only, so a missing row can never break a flow.
+
+    private static BigDecimal nz(BigDecimal v, BigDecimal d) {
+        return v == null ? d : v;
+    }
+
+    private static String fmtAmt(BigDecimal v) {
+        return v == null ? null : v.stripTrailingZeros().toPlainString();
+    }
+
+    public Map<String, Object> branchLimitsForSa(UUID saId) {
+        var row = saId == null ? null : settingRepo.findBySuperAdminId(saId).orElse(null);
+        var out = new LinkedHashMap<String, Object>();
+        out.put("ghMinDeposit", nz(row == null ? null : row.getGhMinDeposit(),
+                nz(platformMinDepositGh, new BigDecimal("20"))));
+        out.put("ngMinDeposit", nz(row == null ? null : row.getNgMinDeposit(), DEFAULT_NG_DEPOSIT));
+        out.put("ghMinStake", nz(row == null ? null : row.getGhMinStake(), DEFAULT_GH_STAKE));
+        out.put("ngMinStake", nz(row == null ? null : row.getNgMinStake(), DEFAULT_NG_STAKE));
+        out.put("ghMinWithdrawal", nz(row == null ? null : row.getGhMinWithdrawal(), DEFAULT_GH_WITHDRAWAL));
+        out.put("ngMinWithdrawal", nz(row == null ? null : row.getNgMinWithdrawal(), DEFAULT_NG_WITHDRAWAL));
+        return out;
+    }
+
+    public Map<String, Object> branchLimitsFor(User user) {
+        return branchLimitsForSa(resolveBranchSuperAdmin(user).orElse(null));
+    }
+
+    public Map<String, Object> branchSettingsForSa(UUID saId) {
+        var row = saId == null ? null : settingRepo.findBySuperAdminId(saId).orElse(null);
+        var set = new LinkedHashMap<String, Object>();
+        set.put("ghMinDeposit", row == null ? null : row.getGhMinDeposit());
+        set.put("ngMinDeposit", row == null ? null : row.getNgMinDeposit());
+        set.put("ghMinStake", row == null ? null : row.getGhMinStake());
+        set.put("ngMinStake", row == null ? null : row.getNgMinStake());
+        set.put("ghMinWithdrawal", row == null ? null : row.getGhMinWithdrawal());
+        set.put("ngMinWithdrawal", row == null ? null : row.getNgMinWithdrawal());
+        var out = new LinkedHashMap<String, Object>();
+        out.put("set", set);
+        out.put("effective", branchLimitsForSa(saId));
+        var defs = new LinkedHashMap<String, Object>();
+        defs.put("ghMinDeposit", nz(platformMinDepositGh, new BigDecimal("20")));
+        defs.put("ngMinDeposit", DEFAULT_NG_DEPOSIT);
+        defs.put("ghMinStake", DEFAULT_GH_STAKE);
+        defs.put("ngMinStake", DEFAULT_NG_STAKE);
+        defs.put("ghMinWithdrawal", DEFAULT_GH_WITHDRAWAL);
+        defs.put("ngMinWithdrawal", DEFAULT_NG_WITHDRAWAL);
+        out.put("defaults", defs);
+        return out;
+    }
+
+    private BigDecimal parseLimit(String key, Object v) {
+        if (v == null) return null;
+        if (v instanceof Number n) {
+            var bd = new BigDecimal(n.toString());
+            if (bd.compareTo(BigDecimal.ZERO) <= 0)
+                throw ApiException.badRequest(key + " must be more than 0.");
+            return bd;
+        }
+        var t = v.toString().trim();
+        if (t.isEmpty()) return null;
+        BigDecimal bd;
+        try {
+            bd = new BigDecimal(t);
+        } catch (NumberFormatException e) {
+            throw ApiException.badRequest(key + " is not a valid amount.");
+        }
+        if (bd.compareTo(BigDecimal.ZERO) <= 0)
+            throw ApiException.badRequest(key + " must be more than 0.");
+        return bd;
+    }
+
+    private static Map<String, Object> auditLimits(Map<String, Object> m) {
+        var out = new LinkedHashMap<String, Object>();
+        for (var e : m.entrySet())
+            out.put(e.getKey(), e.getValue() == null ? "default" : fmtAmt((BigDecimal) e.getValue()));
+        return out;
+    }
+
+    /**
+     * Direct super-admin write of their branch limits. Blank fields keep
+     * their saved value; clear=true wipes all six back to platform
+     * defaults. Values are plain limits (never secrets), so the audit
+     * row carries them in full.
+     */
+    @Transactional
+    public Map<String, Object> setBranchLimits(User sa, Map<String, Object> req, boolean clear) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can set limits for their branch.");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId())
+                .orElseGet(() -> BranchGatewaySetting.builder()
+                        .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
+        var before = branchSettingsForSa(sa.getId());
+        @SuppressWarnings("unchecked")
+        var beforeSet = (Map<String, Object>) before.get("set");
+        if (clear) {
+            setting.setGhMinDeposit(null);
+            setting.setNgMinDeposit(null);
+            setting.setGhMinStake(null);
+            setting.setNgMinStake(null);
+            setting.setGhMinWithdrawal(null);
+            setting.setNgMinWithdrawal(null);
+        } else {
+            var v = parseLimit("ghMinDeposit", req.get("ghMinDeposit"));
+            if (v != null) setting.setGhMinDeposit(v);
+            v = parseLimit("ngMinDeposit", req.get("ngMinDeposit"));
+            if (v != null) setting.setNgMinDeposit(v);
+            v = parseLimit("ghMinStake", req.get("ghMinStake"));
+            if (v != null) setting.setGhMinStake(v);
+            v = parseLimit("ngMinStake", req.get("ngMinStake"));
+            if (v != null) setting.setNgMinStake(v);
+            v = parseLimit("ghMinWithdrawal", req.get("ghMinWithdrawal"));
+            if (v != null) setting.setGhMinWithdrawal(v);
+            v = parseLimit("ngMinWithdrawal", req.get("ngMinWithdrawal"));
+            if (v != null) setting.setNgMinWithdrawal(v);
+        }
+        setting.setUpdatedBy(sa.getId());
+        setting.setUpdatedAt(Instant.now());
+        var saved = settingRepo.save(setting);
+        var after = branchSettingsForSa(sa.getId());
+        @SuppressWarnings("unchecked")
+        var afterSet = (Map<String, Object>) after.get("set");
+        auditService.log(sa.getId(), "SET_BRANCH_LIMITS", "branch_gateway_settings", saved.getId(),
+                auditLimits(beforeSet), auditLimits(afterSet), null);
+        return after;
     }
 }

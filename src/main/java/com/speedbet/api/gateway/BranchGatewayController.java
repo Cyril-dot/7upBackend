@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -28,6 +29,8 @@ public class BranchGatewayController {
     @GetMapping("/gateway")
     public ResponseEntity<ApiResponse<Map<String, Object>>> myBranchGateway(
             @AuthenticationPrincipal User user) {
-        return ResponseEntity.ok(ApiResponse.ok(gatewayService.activeFor(user)));
+        var out = new LinkedHashMap<String, Object>(gatewayService.activeFor(user));
+        out.put("limits", gatewayService.branchLimitsFor(user));
+        return ResponseEntity.ok(ApiResponse.ok(out));
     }
 }
