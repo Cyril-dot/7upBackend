@@ -215,6 +215,9 @@ public class GatewayService {
                 Map.of("ngManualBank", ngManualBankRow(saved), "ngGateway", "MANUAL"), null);
         return ngManualBankRow(saved);
 
+
+    }
+
     // ─── Super admin's OWN Ghana (AkwaPay) credentials ─────────────────
 
     private String requireKeySecret() {
@@ -337,7 +340,6 @@ public class GatewayService {
         var user = userRepo.findById(userId).orElse(null);
         if (user == null) return Optional.empty();
         return resolveBranchSuperAdmin(user);
-    }
     }
 
     public Map<String, Object> requestRowOrNull(UUID superAdminId) {
