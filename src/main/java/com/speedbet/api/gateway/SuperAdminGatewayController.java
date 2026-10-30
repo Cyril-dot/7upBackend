@@ -46,6 +46,7 @@ public class SuperAdminGatewayController {
         var pending = gatewayService.requestRowOrNull(actor.getId());
         var out = new LinkedHashMap<String, Object>();
         out.put("active", active);
+        out.put("ghanaKeys", gatewayService.ghanaKeyStatus(actor.getId()));
         out.put("pendingRequest", pending);
         out.put("allowedGh", GatewayService.ALLOWED_GH);
         out.put("allowedNg", GatewayService.ALLOWED_NG);
@@ -76,6 +77,27 @@ public class SuperAdminGatewayController {
         var saved = gatewayService.setOwnGateways(actor, req.get("ghGateway"), req.get("ngGateway"));
         return ResponseEntity.ok(ApiResponse.ok(saved,
                 "Branch gateways saved. They are live now for users on your branch."));
+    }
+
+    /**
+     * Direct set of the branch's OWN AkwaPay credentials for Ghana
+     * deposits. Blank fields keep their current value; clear=true wipes
+     * both halves back to the platform key. Values are stored encrypted
+     * and never returned — the response carries set/unset + last4 only.
+     */
+    @PutMapping("/ghana-keys")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setGhanaKeys(
+            @AuthenticationPrincipal User actor,
+            @RequestBody Map<String, Object> req) {
+        requireSuperAdmin(actor);
+        boolean clear = Boolean.TRUE.equals(req.get("clear"));
+        var saved = gatewayService.setGhanaKeys(actor,
+                req.get("secretKey") == null ? null : req.get("secretKey").toString(),
+                req.get("webhookSecret") == null ? null : req.get("webhookSecret").toString(),
+                clear);
+        return ResponseEntity.ok(ApiResponse.ok(saved,
+                clear ? "Your own AkwaPay keys were removed. Ghana deposits on your branch now use the platform key."
+                        : "Your own AkwaPay keys were saved. Ghana deposits on your branch now run on your AkwaPay account."));
     }
 
     /**

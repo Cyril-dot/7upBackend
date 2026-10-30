@@ -8,6 +8,7 @@ import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRepository;
 import com.speedbet.api.user.UserRole;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -56,6 +57,14 @@ public class GatewayService {
     private final ReferralLinkRepository linkRepo;
     private final HierarchyService hierarchy;
     private final AuditService auditService;
+
+    // Server env secret that encrypts super-admin gateway credentials.
+    // Direct env reference (no application.properties entry needed):
+    // set GATEWAY_KEY_SECRET on Railway. Blank = fail-closed: saving
+    // branch keys is refused, and reading them falls back to the
+    // platform key, so a missing env var can never leak or break.
+    @Value("${GATEWAY_KEY_SECRET:}")
+    private String gatewayKeySecret;
 
     // ─── Validation ────────────────────────────────────────────────────
 
@@ -205,6 +214,130 @@ public class GatewayService {
                 before == null ? null : Map.of("ngManualBank", before, "ngGateway", beforeNg),
                 Map.of("ngManualBank", ngManualBankRow(saved), "ngGateway", "MANUAL"), null);
         return ngManualBankRow(saved);
+
+    // ─── Super admin's OWN Ghana (AkwaPay) credentials ─────────────────
+
+    private String requireKeySecret() {
+        if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) {
+            throw ApiException.badRequest(
+                    "Gateway key encryption is not configured on the server (GATEWAY_KEY_SECRET).");
+        }
+        return gatewayKeySecret;
+    }
+
+    /** Masked key status only — values are never returned. */
+    public Map<String, Object> ghanaKeyStatus(UUID saId) {
+        var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+        boolean secretSet = setting != null
+                && setting.getGhAkwapaySecretKey() != null
+                && !setting.getGhAkwapaySecretKey().isBlank();
+        boolean whSet = setting != null
+                && setting.getGhAkwapayWebhookSecret() != null
+                && !setting.getGhAkwapayWebhookSecret().isBlank();
+        var out = new LinkedHashMap<String, Object>();
+        out.put("secretKeySet", secretSet);
+        out.put("secretKeyLast4", secretSet ? setting.getGhAkwapaySecretKeyLast4() : null);
+        out.put("webhookSecretSet", whSet);
+        return out;
+    }
+
+    /**
+     * Direct super-admin write of their OWN AkwaPay credentials for
+     * Ghana deposits on their branch. Blank fields keep their current
+     * value; clear=true wipes both halves back to the platform key.
+     * Values are encrypted before storage; audit logs carry only
+     * set/unset + last4, never a value.
+     */
+    @Transactional
+    public Map<String, Object> setGhanaKeys(User sa, String secretKey, String webhookSecret, boolean clear) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can set AkwaPay credentials for their branch.");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId())
+                .orElseGet(() -> BranchGatewaySetting.builder()
+                        .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
+        var before = ghanaKeyStatus(sa.getId());
+        if (clear) {
+            setting.setGhAkwapaySecretKey(null);
+            setting.setGhAkwapaySecretKeyLast4(null);
+            setting.setGhAkwapayWebhookSecret(null);
+        } else {
+            String ks = requireKeySecret();
+            boolean touched = false;
+            if (secretKey != null && !secretKey.isBlank()) {
+                String v = secretKey.trim();
+                try {
+                    setting.setGhAkwapaySecretKey(GatewaySecretCrypto.encrypt(v, ks));
+                } catch (Exception e) {
+                    throw ApiException.badRequest("Could not store the secret key.");
+                }
+                setting.setGhAkwapaySecretKeyLast4(v.length() <= 4 ? v : v.substring(v.length() - 4));
+                touched = true;
+            }
+            if (webhookSecret != null && !webhookSecret.isBlank()) {
+                try {
+                    setting.setGhAkwapayWebhookSecret(GatewaySecretCrypto.encrypt(webhookSecret.trim(), ks));
+                } catch (Exception e) {
+                    throw ApiException.badRequest("Could not store the webhook secret.");
+                }
+                touched = true;
+            }
+            if (!touched) {
+                throw ApiException.badRequest("Enter a secret key, a webhook secret, or use Remove to go back to the platform key.");
+            }
+        }
+        boolean finalSecret = setting.getGhAkwapaySecretKey() != null && !setting.getGhAkwapaySecretKey().isBlank();
+        boolean finalWh = setting.getGhAkwapayWebhookSecret() != null && !setting.getGhAkwapayWebhookSecret().isBlank();
+        if (finalSecret != finalWh) {
+            throw ApiException.badRequest("Save both the secret key and the webhook secret together — a key without its webhook secret creates prompts that can never settle.");
+        }
+        setting.setUpdatedBy(sa.getId());
+        setting.setUpdatedAt(Instant.now());
+        var saved = settingRepo.save(setting);
+        var after = ghanaKeyStatus(sa.getId());
+        auditService.log(sa.getId(), "SET_GHANA_KEYS", "branch_gateway_settings", saved.getId(),
+                Map.of("secretKeySet", before.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(before.get("secretKeyLast4")),
+                        "webhookSecretSet", before.get("webhookSecretSet")),
+                Map.of("secretKeySet", after.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(after.get("secretKeyLast4")),
+                        "webhookSecretSet", after.get("webhookSecretSet")), null);
+        return after;
+    }
+
+    /** Decrypted branch secret key, or empty when unset/unreadable. */
+    public Optional<String> branchSecretKey(UUID saId) {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+            if (setting == null || setting.getGhAkwapaySecretKey() == null
+                    || setting.getGhAkwapaySecretKey().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhAkwapaySecretKey(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Decrypted branch webhook secret, or empty when unset/unreadable. */
+    public Optional<String> branchWebhookSecret(UUID saId) {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+            if (setting == null || setting.getGhAkwapayWebhookSecret() == null
+                    || setting.getGhAkwapayWebhookSecret().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhAkwapayWebhookSecret(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Branch super admin for a user id (webhook routing has no principal). */
+    public Optional<UUID> resolveBranchSuperAdminId(UUID userId) {
+        if (userId == null) return Optional.empty();
+        var user = userRepo.findById(userId).orElse(null);
+        if (user == null) return Optional.empty();
+        return resolveBranchSuperAdmin(user);
+    }
     }
 
     public Map<String, Object> requestRowOrNull(UUID superAdminId) {

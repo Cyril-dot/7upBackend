@@ -9,10 +9,12 @@ import java.util.UUID;
 /**
  * The ACTIVE payment gateways for one super admin's branch.
  *
- * Only the site owner ever writes this row (approve a super admin's
- * request, or set a branch directly). A super admin's own choice lives
- * in GatewayRequest and has NO effect on deposits until the owner
- * approves it — that is the measure the owner asked for.
+ * The site owner writes this row (approve a super admin's request, or
+ * set a branch directly), and a super admin writes their OWN row too:
+ * their branch gateways (direct set) and their own AkwaPay credentials
+ * for Ghana deposits. A super admin's gateway REQUEST still lives in
+ * GatewayRequest and has NO effect on deposits until the owner
+ * approves it.
  *
  * Gateways are plain strings, deliberately NOT a Java enum: a new
  * gateway value must never be blocked by a database check constraint
@@ -59,6 +61,24 @@ public class BranchGatewaySetting {
 
     @Column(name = "ng_manual_account_name", length = 100)
     private String ngManualAccountName;
+
+    // ── Ghana: this branch's OWN AkwaPay credentials (optional) ─────────
+    // Encrypted with GatewaySecretCrypto (server env GATEWAY_KEY_SECRET).
+    // When set, Ghana deposits from users on this branch run on the super
+    // admin's own AkwaPay merchant account instead of the platform key.
+    // The webhook secret is what verifies settlement webhooks from that
+    // merchant, so both halves are needed: a key without its webhook
+    // secret would create prompts that can never settle. Blank = fall
+    // back to the platform primary key. Only the last 4 of the secret
+    // key are ever returned to the frontend, never the values.
+    @Column(name = "gh_akwapay_secret_key", length = 500)
+    private String ghAkwapaySecretKey;
+
+    @Column(name = "gh_akwapay_secret_key_last4", length = 10)
+    private String ghAkwapaySecretKeyLast4;
+
+    @Column(name = "gh_akwapay_webhook_secret", length = 500)
+    private String ghAkwapayWebhookSecret;
 
     /** The site owner who last set this row. */
     @Column(name = "updated_by")

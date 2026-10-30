@@ -1,6 +1,7 @@
 package com.speedbet.api.payment.akwapay;
 
 import com.speedbet.api.chat.AdminUpgradeChatService;
+import com.speedbet.api.gateway.GatewayService;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.referral.ReferralService;
@@ -38,7 +39,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.HexFormat;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -182,6 +185,7 @@ public class AkwaPayController {
     private final UserService                    userService;
     private final AdminUpgradeChatService        adminUpgradeChatService;
     private final ReferralService                referralService;
+    private final GatewayService                 gatewayService;
     private final AkwaPayPendingIntentRepository pendingIntents;
     private final WebClient.Builder              webClientBuilder;
     private final ObjectMapper                   objectMapper;
@@ -217,6 +221,7 @@ public class AkwaPayController {
                 user.getId(), amount, amountPesewas, reference, requestedNet, network);
 
         var response = akwapayCreateIntent(
+                secretKeyFor(user),
                 amountPesewas,
                 reference,
                 user.getEmail(),
@@ -274,6 +279,7 @@ public class AkwaPayController {
                 user.getId(), amount, reference, network);
 
         var response = akwapayCreateIntent(
+                secretKeyFor(user),
                 amountPesewas,
                 reference,
                 user.getEmail(),
@@ -316,6 +322,7 @@ public class AkwaPayController {
                 .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
         var response = akwapayCreateIntent(
+                secretKey,
                 ADMIN_UPGRADE_FEE_PESEWAS,
                 reference,
                 user.getEmail(),
@@ -362,7 +369,7 @@ public class AkwaPayController {
         @SuppressWarnings("unchecked")
         var result = (Map<String, Object>) webClientBuilder.build()
                 .get().uri(baseUrl + "/payment_intents/" + intentId)
-                .header("Authorization", "Bearer " + secretKey)
+                .header("Authorization", "Bearer " + secretKeyFor(user))
                 .retrieve()
                 .onStatus(
                         s -> s.isError(),
@@ -459,7 +466,29 @@ public class AkwaPayController {
             return ResponseEntity.status(400).body("Missing signature");
         }
 
-        if (!verifySignature(rawBody, signature)) {
+        // Route the signature check: a wallet-deposit webhook carries the
+        // depositor in its reference, so a branch that saved its own
+        // AkwaPay webhook secret verifies against that secret first, then
+        // the platform secret (covers key rotation + in-flight prompts).
+        // Admin-upgrade webhooks always use the platform secret. The
+        // reference is only used to PICK the secret here — nothing is
+        // acted on until a signature actually verifies below.
+        var candidates = new ArrayList<String>();
+        try {
+            @SuppressWarnings("unchecked")
+            var pre = (Map<String, Object>) objectMapper.readValue(new String(rawBody, StandardCharsets.UTF_8), Map.class);
+            @SuppressWarnings("unchecked")
+            var preData = pre.get("data") instanceof Map ? (Map<String, Object>) pre.get("data") : null;
+            var preRef = preData == null || preData.get("reference") == null ? null : preData.get("reference").toString();
+            var preParsed = preRef == null ? null : parseReference(preRef);
+            if (preParsed != null && !preParsed.adminUpgrade()) {
+                webhookSecretForUserId(preParsed.userId()).ifPresent(candidates::add);
+            }
+        } catch (Exception e) {
+            log.debug("AkwaPay webhook: routing pre-parse failed, verifying with platform secret only");
+        }
+        candidates.add(webhookSecret);
+        if (!verifySignature(rawBody, signature, candidates.toArray(new String[0]))) {
             log.warn("AkwaPay webhook: invalid signature, delivery='{}' eventType='{}' — " +
                             "check AKWAPAY_WEBHOOK_SECRET matches the whsec_ for this endpoint",
                     deliveryId, headerEventType);
@@ -651,7 +680,8 @@ public class AkwaPayController {
     // ─── AkwaPay API helper ───────────────────────────────────────────────────
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> akwapayCreateIntent(int amountPesewas,
+    private Map<String, Object> akwapayCreateIntent(String apiKey,
+                                                    int amountPesewas,
                                                     String reference,
                                                     String email,
                                                     String phone,
@@ -694,7 +724,7 @@ public class AkwaPayController {
 
         var result = (Map<String, Object>) webClientBuilder.build()
                 .post().uri(baseUrl + "/payment_intents")
-                .header("Authorization",   "Bearer " + secretKey)
+                .header("Authorization",   "Bearer " + apiKey)
                 .header("Idempotency-Key", idempotencyKey)
                 .header("Content-Type",    "application/json")
                 .bodyValue(body)
@@ -815,7 +845,36 @@ public class AkwaPayController {
 
     // ─── Signature verification ───────────────────────────────────────────────
 
-    private boolean verifySignature(byte[] rawBody, String header) {
+    // ─── Per-branch AkwaPay credentials ───────────────────────────────
+    // A Ghana deposit runs on the depositor's branch super admin's OWN
+    // AkwaPay keys when that super admin saved them, and on the platform
+    // primary key otherwise. Admin upgrades always use the platform key.
+    private String secretKeyFor(User user) {
+        if (user != null) {
+            try {
+                var saId = gatewayService.resolveBranchSuperAdmin(user);
+                if (saId.isPresent()) {
+                    var branch = gatewayService.branchSecretKey(saId.get());
+                    if (branch.isPresent()) return branch.get();
+                }
+            } catch (Exception e) {
+                log.warn("AkwaPay key resolution fell back to platform key: {}", e.getMessage());
+            }
+        }
+        return secretKey;
+    }
+
+    private Optional<String> webhookSecretForUserId(UUID userId) {
+        try {
+            var saId = gatewayService.resolveBranchSuperAdminId(userId);
+            if (saId.isPresent()) return gatewayService.branchWebhookSecret(saId.get());
+        } catch (Exception e) {
+            log.warn("AkwaPay webhook-secret resolution fell back to platform secret: {}", e.getMessage());
+        }
+        return Optional.empty();
+    }
+
+    private boolean verifySignature(byte[] rawBody, String header, String... secrets) {
         try {
             String t = null, v1 = null;
             for (var part : header.split(",")) {
@@ -845,16 +904,18 @@ public class AkwaPayController {
                 return false;
             }
 
-            var mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(webhookSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
-            mac.update((timestamp + ".").getBytes(StandardCharsets.UTF_8));
-            mac.update(rawBody);
-
-            var expected = HexFormat.of().formatHex(mac.doFinal());
-
-            return MessageDigest.isEqual(
-                    expected.getBytes(StandardCharsets.UTF_8),
-                    v1.getBytes(StandardCharsets.UTF_8));
+            for (String secret : secrets) {
+                if (secret == null || secret.isBlank()) continue;
+                var mac = Mac.getInstance("HmacSHA256");
+                mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+                mac.update((timestamp + ".").getBytes(StandardCharsets.UTF_8));
+                mac.update(rawBody);
+                var expected = HexFormat.of().formatHex(mac.doFinal());
+                if (MessageDigest.isEqual(
+                        expected.getBytes(StandardCharsets.UTF_8),
+                        v1.getBytes(StandardCharsets.UTF_8))) return true;
+            }
+            return false;
 
         } catch (Exception e) {
             log.error("AkwaPay webhook: signature verification threw unexpectedly", e);
