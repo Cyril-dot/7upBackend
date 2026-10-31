@@ -14,6 +14,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -31,6 +32,7 @@ import reactor.util.retry.Retry;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.math.MathContext;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -43,6 +45,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -165,6 +168,13 @@ public class AkwaPayController {
     private static final String REF_PREFIX_ADMIN   = "sbadm-";
 
     private final Duration akwapayTimeout      = Duration.ofSeconds(15);
+
+    // Verify-number reuse cache: one verification per (phone, network,
+    // amount) is reused for 24h — each verification burns provider quota
+    // shared with collections, so a repeat deposit must not re-verify.
+    private record CachedVerify(Map<String, Object> body, long expiresAt) {}
+    private final ConcurrentHashMap<String, CachedVerify> verifyCache = new ConcurrentHashMap<>();
+    private static final long VERIFY_CACHE_TTL_MS = 24L * 60 * 60 * 1000;
     // Intent creation gets a much longer leash: the ShinobiPay API runs on a
     // free-tier host that can cold-start for ~60s, and a 15s timeout turned
     // every cold start into a failed deposit. Retrying a create is safe —
@@ -408,6 +418,97 @@ public class AkwaPayController {
     }
 
     // ─── OTP submission ───────────────────────────────────────────────────────
+
+    // ─── Verify a MoMo number before prompting (ShinobiPay 31 Oct 2026) ──
+    // Opt-in verify-first flow: the frontend calls this BEFORE creating
+    // an intent, shows the account name + exact total for confirmation,
+    // and only then sends the prompt. no_account -> never prompt.
+    // Provider 502 -> the check itself failed: retry later, never prompt
+    // blind. Results are cached per (phone, network, amount) for 24h so
+    // repeat deposits do not burn provider quota. Uses the same key the
+    // prompt will use (branch key when the SA set one, else platform).
+    @PostMapping("/api/wallet/deposit/akwapay/verify-number")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> verifyNumber(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        var phoneRaw = req.get("phone") == null ? "" : req.get("phone").toString();
+        var digits = phoneRaw.replaceAll("\\D", "");
+        if (digits.startsWith("0") && digits.length() == 10) digits = "233" + digits.substring(1);
+        if (!digits.startsWith("233") || digits.length() != 12)
+            throw ApiException.badRequest("Enter a valid Ghana MoMo number.");
+
+        var amountObj = req.get("amount");
+        if (amountObj == null) throw ApiException.badRequest("Enter an amount to verify.");
+        BigDecimal amount;
+        try {
+            amount = new BigDecimal(amountObj.toString());
+        } catch (Exception e) {
+            throw ApiException.badRequest("Enter a valid amount.");
+        }
+        if (amount.compareTo(BigDecimal.ZERO) <= 0)
+            throw ApiException.badRequest("Enter an amount to verify.");
+        long amountMinor;
+        try {
+            amountMinor = amount.multiply(BigDecimal.valueOf(100))
+                    .setScale(0, RoundingMode.HALF_UP).longValueExact();
+        } catch (Exception e) {
+            throw ApiException.badRequest("Enter a valid amount.");
+        }
+
+        var network = req.get("network") == null ? null : req.get("network").toString().trim().toUpperCase();
+        if (network != null && network.isEmpty()) network = null;
+
+        var key = digits + "|" + (network == null ? "" : network) + "|" + amountMinor;
+        var now = System.currentTimeMillis();
+        var cached = verifyCache.get(key);
+        if (cached != null && cached.expiresAt() > now)
+            return ResponseEntity.ok(ApiResponse.ok(cached.body()));
+
+        var body = new LinkedHashMap<String, Object>();
+        body.put("phone", digits);
+        if (network != null) body.put("network", network);
+        body.put("amount_minor", amountMinor);
+
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Object>) webClientBuilder.build()
+                .post().uri(baseUrl + "/verify-number")
+                .header("Authorization", "Bearer " + secretKeyFor(user))
+                .header("Content-Type", "application/json")
+                .bodyValue(body)
+                .retrieve()
+                .onStatus(
+                        s -> s.isError(),
+                        r -> r.bodyToMono(String.class).map(errBody -> {
+                            log.error("AkwaPay verify-number error: status={} body={}", r.statusCode(), errBody);
+                            int code = r.statusCode().value();
+                            if (code == 502)
+                                return (Throwable) new ApiException(
+                                        "Number verification could not run \u2014 please wait a little and try again. No prompt has been sent.",
+                                        HttpStatus.BAD_GATEWAY);
+                            if (code == 429)
+                                return (Throwable) ApiException.badRequest(
+                                        "The network is busy right now \u2014 please wait a few minutes and try again. No money has been taken");
+                            return (Throwable) ApiException.internal(
+                                    "Number verification failed. Please try again.");
+                        })
+                )
+                .bodyToMono(Map.class)
+                .timeout(akwapayTimeout)
+                .block();
+
+        if (result == null) throw ApiException.internal("Number verification failed. Please try again.");
+
+        var out = new LinkedHashMap<String, Object>();
+        out.put("verified", result.get("verified"));
+        out.put("accountName", result.get("account_name"));
+        out.put("canPrompt", result.get("can_prompt"));
+        out.put("phone", result.get("phone") == null ? digits : result.get("phone").toString());
+        out.put("network", result.get("network") == null ? network : result.get("network").toString());
+        out.put("amount", result.get("amount"));
+        verifyCache.put(key, new CachedVerify(out, now + VERIFY_CACHE_TTL_MS));
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
 
     @PostMapping("/api/wallet/deposit/akwapay/otp")
     public ResponseEntity<ApiResponse<Map<String, Object>>> submitOtp(
@@ -754,6 +855,13 @@ public class AkwaPayController {
                                             clientResponse.statusCode(), reference, errBody);
 
                                     int code = clientResponse.statusCode().value();
+                                    // 429 is provider throttling: the customer must see
+                                    // the busy message, never a raw rejection, and the
+                                    // frontend cools the Pay button down for 60s.
+                                    if (code == 429) {
+                                        return (Throwable) ApiException.badRequest(
+                                                "The network is busy right now \u2014 please wait a few minutes and try again. No money has been taken");
+                                    }
                                     // 503 is surfaced too: it is how the API says
                                     // "payments are switched off" (gateway_unavailable,
                                     // with the operator's message in the body) — the
