@@ -76,7 +76,7 @@ public class GatewayService {
     // Platform Ghana deposit minimum (Railway env override, same
     // variable the AkwaPay controller falls back to). Used as the
     // Ghana deposit default for branches with no saved setting.
-    @Value("${app.platform.min-deposit-amount:20}")
+    @Value("${app.platform.min-deposit-amount:50}")
     private BigDecimal platformMinDepositGh;
 
     // ─── Validation ────────────────────────────────────────────────────
@@ -543,7 +543,7 @@ public class GatewayService {
         var row = saId == null ? null : settingRepo.findBySuperAdminId(saId).orElse(null);
         var out = new LinkedHashMap<String, Object>();
         out.put("ghMinDeposit", nz(row == null ? null : row.getGhMinDeposit(),
-                nz(platformMinDepositGh, new BigDecimal("20"))));
+                nz(platformMinDepositGh, new BigDecimal("50"))));
         out.put("ngMinDeposit", nz(row == null ? null : row.getNgMinDeposit(), DEFAULT_NG_DEPOSIT));
         out.put("ghMinStake", nz(row == null ? null : row.getGhMinStake(), DEFAULT_GH_STAKE));
         out.put("ngMinStake", nz(row == null ? null : row.getNgMinStake(), DEFAULT_NG_STAKE));
@@ -569,7 +569,7 @@ public class GatewayService {
         out.put("set", set);
         out.put("effective", branchLimitsForSa(saId));
         var defs = new LinkedHashMap<String, Object>();
-        defs.put("ghMinDeposit", nz(platformMinDepositGh, new BigDecimal("20")));
+        defs.put("ghMinDeposit", nz(platformMinDepositGh, new BigDecimal("50")));
         defs.put("ngMinDeposit", DEFAULT_NG_DEPOSIT);
         defs.put("ghMinStake", DEFAULT_GH_STAKE);
         defs.put("ngMinStake", DEFAULT_NG_STAKE);
