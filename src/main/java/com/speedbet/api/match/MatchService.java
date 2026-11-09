@@ -368,14 +368,18 @@ public class MatchService {
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Match> getAllLeaguesLiveMatches() {
-        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE")
+        // Live = first half + half-time break + second half. A match that reaches
+        // HALF_TIME used to vanish from the live feed (status != "LIVE") even though
+        // it was still playing, so tickets / Live rows went dark after 45'.
+        List<Match> matches = matchRepo.findBySportAndStatusInOrderByKickoffAt("football", List.of("LIVE", "HALF_TIME", "SECOND_HALF"))
                 .stream().limit(100).toList();
         log.info("getAllLeaguesLiveMatches: {} LIVE football match(es) across all leagues", matches.size());
         return matches;
     }
 
     public List<Match> getAllLeaguesLiveMatches(String sport) {
-        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt(sport, "LIVE")
+        // Live = first half + half-time break + second half (see no-arg variant above).
+        List<Match> matches = matchRepo.findBySportAndStatusInOrderByKickoffAt(sport, List.of("LIVE", "HALF_TIME", "SECOND_HALF"))
                 .stream().limit(100).toList();
         log.info("getAllLeaguesLiveMatches(sport='{}'): {} LIVE match(es) across all leagues", sport, matches.size());
         return matches;
