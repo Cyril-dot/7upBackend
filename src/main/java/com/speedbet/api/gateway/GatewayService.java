@@ -56,7 +56,7 @@ public class GatewayService {
     public static final BigDecimal DEFAULT_NG_WITHDRAWAL = new BigDecimal("200000");
 
     public static final Set<String> ALLOWED_GH = Set.of("AKWAPAY", "GMP");
-    public static final Set<String> ALLOWED_NG = Set.of("GMP", "KORAPAY", "MANUAL");
+    public static final Set<String> ALLOWED_NG = Set.of("GMP", "KORAPAY", "MANUAL", "FLUTTERWAVE");
 
     private final BranchGatewaySettingRepository settingRepo;
     private final GatewayRequestRepository requestRepo;
@@ -91,7 +91,7 @@ public class GatewayService {
     private String requireNg(String ng) {
         if (ng == null || ng.isBlank()) throw ApiException.badRequest("A Nigeria gateway is required.");
         var v = ng.trim().toUpperCase();
-        if (!ALLOWED_NG.contains(v)) throw ApiException.badRequest("Nigeria gateway must be one of: GMP, KORAPAY.");
+        if (!ALLOWED_NG.contains(v)) throw ApiException.badRequest("Nigeria gateway must be one of: GMP, KORAPAY, MANUAL, FLUTTERWAVE.");
         return v;
     }
 
@@ -482,12 +482,12 @@ public class GatewayService {
     /**
      * Direct super-admin write of their OWN branch's gateways — no site
      * owner approval. Ghana is AkwaPay only (the only Ghana gateway the
-     * deposit page offers); Nigeria is MANUAL only (manual bank transfer
-     * is the only Nigeria method the deposit page offers since checkout
-     * was removed). At least one side must be supplied; the other side
-     * keeps its current value. A pending gateway request is left alone:
-     * the owner can still approve/reject it, and an approval would then
-     * overwrite this direct set — the owner remains the final override.
+     * deposit page offers); Nigeria is MANUAL (manual bank transfer) or
+     * FLUTTERWAVE (Flutterwave v3 + v4: bank transfer, USSD, card, Opay).
+     * At least one side must be supplied; the other side keeps its
+     * current value. A pending gateway request is left alone: the owner
+     * can still approve/reject it, and an approval would then overwrite
+     * this direct set — the owner remains the final override.
      */
     @Transactional
     public Map<String, Object> setOwnGateways(User sa, String gh, String ng) {
@@ -503,8 +503,8 @@ public class GatewayService {
         }
         if (ng != null && !ng.isBlank()) {
             ngV = ng.trim().toUpperCase();
-            if (!"MANUAL".equals(ngV)) {
-                throw ApiException.badRequest("Nigeria gateway is manual bank transfer.");
+            if (!"MANUAL".equals(ngV) && !"FLUTTERWAVE".equals(ngV)) {
+                throw ApiException.badRequest("Nigeria gateway is manual bank transfer or Flutterwave.");
             }
         }
         if (ghV == null && ngV == null) {
