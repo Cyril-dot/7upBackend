@@ -64,20 +64,19 @@ import java.util.Map;
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
- *  KNOWN GAP — NGN v4 is not routed.
+ *  NGN v4 IS routed (v126) — by signature header, not payload fields.
  *
- *  FlutterwaveNgBankV4DepositController exposes its own
- *  /api/webhooks/flutterwave/v4/ng-bank endpoint, but Flutterwave will never
- *  call it: only this URL is registered. Every NGN payload currently goes to
- *  the v3 handler regardless of which API version produced it, so an NGN v4
- *  charge's webhook will be misrouted and rejected.
- *
- *  That is survivable but not good: NGN v4 deposits will only be credited by
- *  the frontend's /verify polling or by the background reconciler, never
- *  promptly by webhook. Wiring it up needs a v3-vs-v4 discriminator for NGN
- *  the same way GHS has one — do NOT reuse the "reference" check blindly,
- *  because the v3 NGN payload's field set hasn't been checked against it.
- *  Capture a real NGN v4 delivery first, then add the branch below.
+ *  NGN v4 charges (bank transfer, USSD, Opay) carry the v4
+ *  flutterwave-signature header and no verif-hash; NGN v3 charges carry
+ *  verif-hash and no flutterwave-signature. route() checks for the v4
+ *  header first and forwards the full header map to
+ *  FlutterwaveNgBankV4DepositController.webhook(), which re-verifies the
+ *  HMAC signature and its own currency before crediting. The payload-field
+ *  discriminator ("reference") is deliberately NOT used for NGN — the v3
+ *  NGN payload's field set hasn't been checked against it, and the header
+ *  is the reliable signal. The v4 controller's own
+ *  /api/webhooks/flutterwave/v4/ng endpoint still works for manual testing,
+ *  but Flutterwave itself only ever calls this router URL.
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ngBankController (v3) is currently unused by route() below — it's injected
@@ -114,6 +113,7 @@ public class FlutterwaveWebhookRouterController {
     private final FlutterwaveGhV4DepositController   ghV4Controller;
     private final FlutterwaveNgDepositController     ngController;
     private final FlutterwaveNgBankDepositController ngBankController; // see class doc — reserved for future use
+    private final FlutterwaveNgBankV4DepositController ngV4Controller;
 
     @PostMapping("/api/webhooks/flutterwave")
     public ResponseEntity<String> route(
@@ -134,10 +134,17 @@ public class FlutterwaveWebhookRouterController {
         }
 
         if (containsCurrency(bodyStr, "NGN")) {
-            // Covers both USSD and Pay-with-Bank (mono) NGN charges — see
-            // class-level doc for why this doesn't need to distinguish them.
-            // NOTE: this also swallows NGN *v4* payloads, which the v3 handler
-            // cannot process — see the KNOWN GAP note in the class javadoc.
+            // v4 NG charges (bank transfer, USSD, Opay) carry the v4
+            // flutterwave-signature header and no verif-hash; v3 NG charges
+            // carry verif-hash and no flutterwave-signature. Discriminating
+            // on the header (not the payload field names) is safe: the v4
+            // handler re-verifies the signature and its own currency before
+            // crediting anything, so a wrong guess is a clean rejection,
+            // never a wrongly-credited wallet.
+            if (hasHeader(headers, "flutterwave-signature")) {
+                log.info("Flutterwave webhook router: routing to NG v4 handler");
+                return ngV4Controller.webhook(headers, rawBody);
+            }
             log.info("Flutterwave webhook router: routing to NG handler");
             return ngController.webhook(verifHash(headers), rawBody);
         }
@@ -167,6 +174,21 @@ public class FlutterwaveWebhookRouterController {
             }
         }
         return null;
+    }
+
+    /**
+     * Case-insensitive check for a header's presence (value ignored).
+     * Used to tell v4 deliveries apart: v4 sends flutterwave-signature,
+     * v3 sends verif-hash, and neither sends the other's header.
+     */
+    private static boolean hasHeader(Map<String, String> headers, String name) {
+        if (headers == null) return false;
+        for (var entry : headers.entrySet()) {
+            if (entry.getKey() != null && name.equalsIgnoreCase(entry.getKey())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
