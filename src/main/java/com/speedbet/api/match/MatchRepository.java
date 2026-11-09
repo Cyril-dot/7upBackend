@@ -125,6 +125,8 @@ public interface MatchRepository extends JpaRepository<Match, UUID> {
 
     List<Match> findBySportAndStatusOrderByKickoffAt(String sport, String status);
 
+    List<Match> findBySportAndStatusInOrderByKickoffAt(String sport, List<String> statuses);
+
     @Query("""
             SELECT m FROM Match m
             WHERE m.sport = :sport
