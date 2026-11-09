@@ -288,7 +288,7 @@ public class FlutterwaveNgV3DepositController extends AbstractFlutterwaveDeposit
         body.put("redirect_url", frontendUrl + "/deposit?method=ngv3");
         body.put("customer", customer);
         body.put("customizations", Map.of(
-                "title", "LuckyStake",
+                "title", "7UP BET",
                 "description", "Wallet deposit"));
         body.put("payment_options", method.equals("opay") ? "opay" : "card,account");
         body.put("meta", Map.of("userId", user.getId().toString()));
