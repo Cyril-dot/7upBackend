@@ -73,6 +73,21 @@ public class SuperAdminCommissionController {
     }
 
     /**
+     * Who deposited for one admin on one UTC day, aggregated per user
+     * (most-deposited first). Date defaults to today. Same UTC day window
+     * as the daily endpoints; a normal super admin is scoped to their own
+     * admins, the site owner bypasses scoping.
+     */
+    @GetMapping("/daily/{adminId}/depositors")
+    public ResponseEntity<ApiResponse<List<SuperAdminCommissionOperationsDtos.AdminDailyDepositorDto>>> depositorsForAdmin(
+            @org.springframework.security.core.annotation.AuthenticationPrincipal com.speedbet.api.user.User actor,
+            @PathVariable UUID adminId,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        requireAdminOf(actor, adminId);
+        return ResponseEntity.ok(ApiResponse.ok(operationsService.depositors(adminId, date)));
+    }
+
+    /**
      * Mark commission as paid, without requiring an admin request.
      * Without {@code amount}: settles the full unpaid amount for one UTC day.
      * With {@code amount}: records a partial payment, deducted from the balance.

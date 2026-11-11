@@ -49,12 +49,28 @@ public class AffiliateDailyPayoutScheduler {
     private BigDecimal minimumPayoutAmount;
 
     /**
+     * Daily sweep DISABLED at the owner's order (Nov 2026): the per-day
+     * clearing was removed, so affiliate commission balances are NO LONGER
+     * swept/zeroed each night. The super admin now pays admins manually
+     * (notification centre + per-admin pay), so this sweep must not empty
+     * balances out from under them. The scheduler and this method are kept
+     * so the sweep can be re-enabled via config if ever needed.
+     * Toggle: speedbet.affiliate.payout.enabled (default false = disabled).
+     */
+    @Value("${speedbet.affiliate.payout.enabled:false}")
+    private boolean payoutSweepEnabled;
+
+    /**
      * Main daily sweep.
      * Default cron: 01:00 UTC every day.
      * Override via speedbet.affiliate.payout.cron in application.yml.
      */
     @Scheduled(cron = "${speedbet.affiliate.payout.cron:0 0 1 * * *}", zone = "UTC")
     public void runDailyPayout() {
+        if (!payoutSweepEnabled) {
+            log.info("AffiliateDailyPayoutScheduler: daily sweep is disabled (per-day clearing removed) — super admin pays manually");
+            return;
+        }
         log.info("AffiliateDailyPayoutScheduler: starting daily commission payout sweep");
 
         List<AffiliateCommissionBalance> eligible =

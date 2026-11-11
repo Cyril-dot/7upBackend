@@ -51,4 +51,21 @@ public final class SuperAdminCommissionOperationsDtos {
             List<UUID> adminIds,
             java.time.Instant clearedAt
     ) {}
+
+    /**
+     * One depositor for an admin on one UTC day (aggregated per user).
+     * {@code currency} is the depositor's own currency (GHS or NGN) and
+     * {@code depositTotal} is in that original currency — amounts are never
+     * converted or combined across currencies.
+     */
+    public record AdminDailyDepositorDto(
+            UUID userId,
+            String email,
+            String firstName,
+            String lastName,
+            String country,
+            String currency,
+            BigDecimal depositTotal,
+            long depositCount
+    ) {}
 }
