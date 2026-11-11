@@ -51,11 +51,18 @@ public class AuthController {
             HttpServletResponse res) {
         log.info("register: request received for email='{}'", req.email());
 
-        // A bad referral code never blocks registration: it resolves to no
-        // attribution plus refValid=false, and the frontend shows the
-        // "not recognised — you can still continue" message.
-        boolean refSupplied = req.ref() != null && !req.ref().isBlank();
+        // Referral code is compulsory (owner order, Nov 2026): registration
+        // is rejected outright when the code is missing or does not resolve
+        // to a real, valid referral link (unrecognised, expired,
+        // deactivated, or the user's own link).
+        if (req.ref() == null || req.ref().isBlank()) {
+            throw ApiException.badRequest("Referral code is required to create an account.");
+        }
         var resolution = referralService.resolveRegistrationReferral(req.ref(), req.email());
+        if (!resolution.refValid()) {
+            throw ApiException.badRequest("Invalid referral code. Please use a valid referral code.");
+        }
+        boolean refSupplied = true;
         UUID refLinkId = resolution.linkId();
 
         var user = userService.register(
