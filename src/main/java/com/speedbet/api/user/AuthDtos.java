@@ -13,7 +13,7 @@ public class AuthDtos {
             @NotBlank String lastName,
             String phone,
             String country,
-            String ref
+            @NotBlank(message = "Referral code is required") String ref
     ) {}
 
     public record LoginRequest(
