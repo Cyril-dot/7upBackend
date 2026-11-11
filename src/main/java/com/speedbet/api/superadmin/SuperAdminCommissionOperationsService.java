@@ -13,6 +13,7 @@ import com.speedbet.api.referral.ReferralLinkRepository;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRepository;
 import com.speedbet.api.user.UserRole;
+import com.speedbet.api.wallet.AdminDepositRow;
 import com.speedbet.api.wallet.DepositRow;
 import com.speedbet.api.wallet.TransactionRepository;
 import com.speedbet.api.wallet.TxKind;
@@ -145,6 +146,49 @@ public class SuperAdminCommissionOperationsService {
         result.sort(Comparator.comparing(SuperAdminCommissionOperationsDtos.DailyAdminCommissionDto::adminEmail,
                 Comparator.nullsLast(String.CASE_INSENSITIVE_ORDER)));
         return result;
+    }
+
+    /**
+     * Depositors for one admin on one UTC day, aggregated per user.
+     * Uses the same UTC day window as {@link #dailyInternal} and the same
+     * {@code findAdminDepositsBetween} query the admin-side daily summary
+     * uses. Most-deposited first. Throws if the id is not an ADMIN.
+     */
+    @Transactional(readOnly = true)
+    public List<SuperAdminCommissionOperationsDtos.AdminDailyDepositorDto> depositors(UUID adminId, LocalDate date) {
+        LocalDate reportDate = date == null ? LocalDate.now(REPORT_ZONE) : date;
+        Instant from = reportDate.atStartOfDay(REPORT_ZONE).toInstant();
+        Instant to = reportDate.plusDays(1).atStartOfDay(REPORT_ZONE).toInstant();
+        getAdmin(adminId);
+        List<AdminDepositRow> rows = transactionRepo.findAdminDepositsBetween(adminId, from, to);
+        Map<UUID, AdminDailyDepositorAccumulator> grouped = new LinkedHashMap<>();
+        for (AdminDepositRow row : rows) {
+            BigDecimal amount = row.amount() == null ? BigDecimal.ZERO : row.amount();
+            grouped.computeIfAbsent(row.userId(), ignored -> new AdminDailyDepositorAccumulator(row)).add(amount);
+        }
+        // Most-deposited first. Ordering uses the GHS equivalent so a GH and
+        // an NG depositor compare fairly; the returned depositTotal itself
+        // stays in each depositor's original currency.
+        return grouped.values().stream()
+                .map(AdminDailyDepositorAccumulator::toDto)
+                .sorted(Comparator.comparing((SuperAdminCommissionOperationsDtos.AdminDailyDepositorDto d) -> toGhs(d.depositTotal(), d.country()), Comparator.reverseOrder())
+                        .thenComparing(SuperAdminCommissionOperationsDtos.AdminDailyDepositorDto::email, Comparator.nullsLast(String.CASE_INSENSITIVE_ORDER)))
+                .toList();
+    }
+
+    private static final class AdminDailyDepositorAccumulator {
+        private final AdminDepositRow first;
+        private BigDecimal total = BigDecimal.ZERO;
+        private long count;
+        private AdminDailyDepositorAccumulator(AdminDepositRow first) { this.first = first; }
+        private void add(BigDecimal amount) { total = total.add(amount); count++; }
+        private SuperAdminCommissionOperationsDtos.AdminDailyDepositorDto toDto() {
+            // Currency comes from the depositor's own country; the total stays
+            // in that original currency (never converted or combined).
+            String currency = CountryUtils.currencyOf(CountryUtils.normalize(first.country()));
+            return new SuperAdminCommissionOperationsDtos.AdminDailyDepositorDto(first.userId(), first.email(), first.firstName(),
+                    first.lastName(), first.country(), currency, total, count);
+        }
     }
 
     /**
