@@ -81,6 +81,20 @@ public class BranchGatewaySetting {
     @Column(name = "gh_akwapay_webhook_secret", length = 500)
     private String ghAkwapayWebhookSecret;
 
+    // ── Ghana: this branch's OWN AlphaPay secret key (optional) ─────────
+    // Encrypted with GatewaySecretCrypto (server env GATEWAY_KEY_SECRET).
+    // When set, Ghana deposits from users on this branch run on the super
+    // admin's own AlphaPay merchant account instead of the platform key.
+    // AlphaPay uses the SAME secret key for the Bearer auth AND for the
+    // webhook HMAC (X-AlphaPay-Signature), so there is no separate
+    // webhook secret. Blank = fall back to the platform key. Only the
+    // last 4 are ever returned to the frontend, never the value.
+    @Column(name = "gh_alphapay_secret_key", length = 500)
+    private String ghAlphapaySecretKey;
+
+    @Column(name = "gh_alphapay_secret_key_last4", length = 10)
+    private String ghAlphapaySecretKeyLast4;
+
     // ── Branch platform settings: per-branch limits (optional) ────────
     // Null = platform default. The super admin sets these from their
     // Settings tab; the deposit page, betslip and withdrawal page all
