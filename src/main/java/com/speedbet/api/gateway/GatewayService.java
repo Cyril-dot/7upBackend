@@ -46,7 +46,7 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class GatewayService {
 
-    public static final String DEFAULT_GH = "AKWAPAY";
+    public static final String DEFAULT_GH = "ALPHAPAY"; // v157: AlphaPay is the default + fallback Ghana gateway
     public static final String DEFAULT_NG = "GMP";
 
     public static final BigDecimal DEFAULT_NG_DEPOSIT = new BigDecimal("10000");
