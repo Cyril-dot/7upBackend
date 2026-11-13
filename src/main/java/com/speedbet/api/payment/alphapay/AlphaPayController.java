@@ -110,11 +110,20 @@ public class AlphaPayController {
 
         var reference = buildReference(user.getId());
 
+        // The domain AlphaPay checks must be the domain the customer is
+        // actually on (it has to be whitelisted on the AlphaPay account).
+        // The frontend sends its own hostname; the env domain is the
+        // fallback when it doesn't.
+        String useDomain = domain;
+        if (req.get("domain") != null && !req.get("domain").toString().isBlank()) {
+            useDomain = req.get("domain").toString().trim();
+        }
+
         var body = new LinkedHashMap<String, Object>();
         body.put("amount",       amount);              // BigDecimal, GHS, 2dp — NOT pesewas
         body.put("currency",     "GHS");
         body.put("reference",    reference);
-        body.put("domain",       domain);
+        body.put("domain",       useDomain);
         body.put("callback_url", callbackUrl);
         if (phone != null) body.put("phone_number", phone);
 
