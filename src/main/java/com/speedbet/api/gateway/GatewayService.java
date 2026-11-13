@@ -496,10 +496,10 @@ public class GatewayService {
         }
         String ghV = null, ngV = null;
         if (gh != null && !gh.isBlank()) {
-            ghV = gh.trim().toUpperCase();
-            if (!"AKWAPAY".equals(ghV)) {
-                throw ApiException.badRequest("Ghana gateway is AkwaPay.");
-            }
+            // v148: was hardcoded to AKWAPAY-only — the SA toggle to AlphaPay
+            // always 400'd. Validate against ALLOWED_GH (AKWAPAY/GMP/ALPHAPAY)
+            // like every other setter, via optGh.
+            ghV = optGh(gh);
         }
         if (ng != null && !ng.isBlank()) {
             ngV = ng.trim().toUpperCase();
