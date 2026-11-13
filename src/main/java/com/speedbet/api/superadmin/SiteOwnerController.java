@@ -3,6 +3,7 @@ package com.speedbet.api.superadmin;
 import com.speedbet.api.audit.AuditService;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
+import com.speedbet.api.common.PageResponse;
 import com.speedbet.api.user.HierarchyService;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRepository;
@@ -11,6 +12,8 @@ import com.speedbet.api.user.UserService;
 import com.speedbet.api.user.UserStatus;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -137,6 +140,47 @@ public class SiteOwnerController {
                         "status", (Object) a.getStatus().name()))
                 .toList());
         return ResponseEntity.ok(ApiResponse.ok(row));
+    }
+
+    // ─── All users (owner sees everyone — no scoping) ───────────────────
+    // The super-admin list at GET /api/super-admin/users is class-level
+    // SUPER_ADMIN, so the owner gets 403 there. These two endpoints are
+    // the owner's own copy, using the UNSCOPED queryService.listUsers
+    // overload (no visibleUserIds → every user in the system).
+
+    /**
+     * GET /api/site-owner/users
+     *
+     * Query params:
+     *   page   (int,    default 0)
+     *   size   (int,    default 20)
+     *   search (string, optional) — matches email, firstName, lastName
+     *   role   (string, optional) — USER | ADMIN | SUPER_ADMIN | SITE_OWNER
+     *
+     * Response: paginated list of UserSummaryDto (id, email, firstName,
+     * lastName, phone, country, role, status, emailVerified, createdAt).
+     */
+    @GetMapping("/users")
+    public ResponseEntity<ApiResponse<PageResponse<SuperAdminDtos.UserSummaryDto>>> listUsers(
+            @RequestParam(defaultValue = "0")  int page,
+            @RequestParam(defaultValue = "20") int size,
+            @RequestParam(required = false)    String search,
+            @RequestParam(required = false)    UserRole role) {
+        var pageable = PageRequest.of(page, size, Sort.by("createdAt").descending());
+        return ResponseEntity.ok(ApiResponse.ok(
+                new PageResponse<>(queryService.listUsers(search, role, pageable))));
+    }
+
+    /**
+     * GET /api/site-owner/users/{id}
+     *
+     * Returns full user profile + wallet summary (balance, currency,
+     * total deposited, total withdrawn, transaction count).
+     */
+    @GetMapping("/users/{id}")
+    public ResponseEntity<ApiResponse<SuperAdminDtos.UserDetailDto>> getUserDetail(
+            @PathVariable UUID id) {
+        return ResponseEntity.ok(ApiResponse.ok(queryService.getUserDetail(id)));
     }
 
     // ─── Global dashboard ───────────────────────────────────────────────
