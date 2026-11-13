@@ -55,7 +55,7 @@ public class GatewayService {
     public static final BigDecimal DEFAULT_GH_WITHDRAWAL = new BigDecimal("2000");
     public static final BigDecimal DEFAULT_NG_WITHDRAWAL = new BigDecimal("200000");
 
-    public static final Set<String> ALLOWED_GH = Set.of("AKWAPAY", "GMP");
+    public static final Set<String> ALLOWED_GH = Set.of("AKWAPAY", "GMP", "ALPHAPAY");
     public static final Set<String> ALLOWED_NG = Set.of("GMP", "KORAPAY", "MANUAL", "FLUTTERWAVE");
 
     private final BranchGatewaySettingRepository settingRepo;
@@ -84,7 +84,7 @@ public class GatewayService {
     private String requireGh(String gh) {
         if (gh == null || gh.isBlank()) throw ApiException.badRequest("A Ghana gateway is required.");
         var v = gh.trim().toUpperCase();
-        if (!ALLOWED_GH.contains(v)) throw ApiException.badRequest("Ghana gateway must be one of: AKWAPAY, GMP.");
+        if (!ALLOWED_GH.contains(v)) throw ApiException.badRequest("Ghana gateway must be one of: AKWAPAY, GMP, ALPHAPAY.");
         return v;
     }
 
