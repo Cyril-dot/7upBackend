@@ -48,13 +48,15 @@ import java.util.regex.Pattern;
 /**
  * AlphaPay (https://alphapay.edibytes.online/docs) mobile-money deposit integration.
  *
- * Flow (direct MoMo push ONLY — no hosted checkout, no OTP, no USSD):
- *  1. POST /api/wallet/deposit/alphapay/init        -> dispatches the MoMo prompt
- *     straight to the phone; the customer approves with their MoMo PIN.
- *     Needs OTP verification switched OFF on the AlphaPay account; if AlphaPay
- *     still returns a checkout_url, the frontend says so instead of redirecting.
- *  2. Customer approves on phone; AlphaPay POSTs webhook to /api/webhooks/alphapay
- *  3. GET  /api/wallet/deposit/alphapay/verify/{ref} -> frontend poll / fallback; also credits (idempotent)
+ * Flow:
+ *  1. POST /api/wallet/deposit/alphapay/init        -> AlphaPay sends an SMS code
+ *     when OTP verification is ON on the account (status otp_required), or
+ *     dispatches the MoMo prompt straight to the phone when it is OFF.
+ *  2. POST /api/wallet/deposit/alphapay/submit-otp  -> OUR OWN 7UP OTP page
+ *     (no hosted-checkout redirect): the customer enters the 6-digit SMS code
+ *     here; a correct code dispatches the MoMo prompt in the same request.
+ *  3. Customer approves on phone; AlphaPay POSTs webhook to /api/webhooks/alphapay
+ *  4. GET  /api/wallet/deposit/alphapay/verify/{ref} -> frontend poll / fallback; also credits (idempotent)
  *
  * Security model:
  *  - Webhook identity = HMAC-SHA256 over raw body, keyed with secret key (X-AlphaPay-Signature).
@@ -136,6 +138,33 @@ public class AlphaPayController {
 
         log.info("[AlphaPay][init] DONE — userId='{}' ref='{}' status='{}' hasCheckoutUrl={}",
                 user.getId(), reference, response.get("status"), response.get("checkout_url") != null);
+
+        return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Step 2 — Submit OTP from OUR OWN 7UP OTP page (v156).
+    // AlphaPay's verify-otp is unauthenticated on their side (scoped by the
+    // unguessable reference) and, on a correct code, dispatches the real MoMo
+    // charge in the same request. A wrong/expired code is a 400 with an
+    // error.message; resend = init again with the same phone (fresh code).
+    // Body: { "reference": "DEP_...", "code": "123456" }
+    // ═══════════════════════════════════════════════════════════════════════════
+    @PostMapping("/api/wallet/deposit/alphapay/submit-otp")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> submitOtp(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        var reference = requireNonBlank(req, "reference");
+        var code      = requireNonBlank(req, "code");
+        assertReferenceBelongsTo(user, reference);
+
+        log.info("[AlphaPay][submitOtp] userId='{}' ref='{}'", user.getId(), reference);
+
+        // verify-otp needs no Bearer token (scoped by reference); the branch
+        // key is resolved for consistency with init/verify.
+        var response = callAlphaPay(HttpMethod.POST, "/payments/" + reference + "/verify-otp/",
+                Map.of("code", code), false, "submitOtp", secretKeyFor(user));
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
