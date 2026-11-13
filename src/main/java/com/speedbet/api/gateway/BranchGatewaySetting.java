@@ -34,7 +34,7 @@ public class BranchGatewaySetting {
     @Column(name = "super_admin_id", nullable = false, unique = true)
     private UUID superAdminId;
 
-    /** Ghana deposit gateway. Allowed: AKWAPAY, GMP. */
+    /** Ghana deposit gateway. Allowed: AKWAPAY, GMP, ALPHAPAY, RUSHPAY. */
     @Column(name = "gh_gateway", nullable = false, length = 30)
     @Builder.Default
     private String ghGateway = "AKWAPAY";
@@ -94,6 +94,27 @@ public class BranchGatewaySetting {
 
     @Column(name = "gh_alphapay_secret_key_last4", length = 10)
     private String ghAlphapaySecretKeyLast4;
+
+    // ── Ghana: this branch's OWN RushPay credentials (optional) ─────────
+    // Encrypted with GatewaySecretCrypto (server env GATEWAY_KEY_SECRET).
+    // When set, Ghana deposits from users on this branch run on the super
+    // admin's own RushPay merchant account instead of the platform keys.
+    // RushPay needs BOTH halves: the API key (X-API-Key) creates checkouts
+    // and the webhook secret verifies settlement webhooks (HMAC) — a key
+    // without its webhook secret would create payments that can never
+    // settle by webhook. Blank = fall back to the platform keys. Only the
+    // last 4 of the API key are ever returned, never the values.
+    @Column(name = "gh_rushpay_api_key", length = 500)
+    private String ghRushpayApiKey;
+
+    @Column(name = "gh_rushpay_api_key_last4", length = 10)
+    private String ghRushpayApiKeyLast4;
+
+    @Column(name = "gh_rushpay_webhook_secret", length = 500)
+    private String ghRushpayWebhookSecret;
+
+    @Column(name = "gh_rushpay_webhook_secret_last4", length = 10)
+    private String ghRushpayWebhookSecretLast4;
 
     // ── Branch platform settings: per-branch limits (optional) ────────
     // Null = platform default. The super admin sets these from their

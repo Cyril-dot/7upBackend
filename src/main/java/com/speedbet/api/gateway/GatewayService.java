@@ -55,7 +55,7 @@ public class GatewayService {
     public static final BigDecimal DEFAULT_GH_WITHDRAWAL = new BigDecimal("2000");
     public static final BigDecimal DEFAULT_NG_WITHDRAWAL = new BigDecimal("200000");
 
-    public static final Set<String> ALLOWED_GH = Set.of("AKWAPAY", "GMP", "ALPHAPAY");
+    public static final Set<String> ALLOWED_GH = Set.of("AKWAPAY", "GMP", "ALPHAPAY", "RUSHPAY");
     public static final Set<String> ALLOWED_NG = Set.of("GMP", "KORAPAY", "MANUAL", "FLUTTERWAVE");
 
     private final BranchGatewaySettingRepository settingRepo;
@@ -85,7 +85,7 @@ public class GatewayService {
     private String requireGh(String gh) {
         if (gh == null || gh.isBlank()) throw ApiException.badRequest("A Ghana gateway is required.");
         var v = gh.trim().toUpperCase();
-        if (!ALLOWED_GH.contains(v)) throw ApiException.badRequest("Ghana gateway must be one of: AKWAPAY, GMP, ALPHAPAY.");
+        if (!ALLOWED_GH.contains(v)) throw ApiException.badRequest("Ghana gateway must be one of: AKWAPAY, GMP, ALPHAPAY, RUSHPAY.");
         return v;
     }
 
@@ -418,6 +418,118 @@ public class GatewayService {
         }
     }
 
+    /** Masked RushPay key status only — the values are never returned. */
+    public Map<String, Object> rushPayKeyStatus(UUID saId) {
+        var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+        boolean apiSet = setting != null
+                && setting.getGhRushpayApiKey() != null
+                && !setting.getGhRushpayApiKey().isBlank();
+        boolean whSet = setting != null
+                && setting.getGhRushpayWebhookSecret() != null
+                && !setting.getGhRushpayWebhookSecret().isBlank();
+        var out = new LinkedHashMap<String, Object>();
+        out.put("apiKeySet", apiSet);
+        out.put("apiKeyLast4", apiSet ? setting.getGhRushpayApiKeyLast4() : null);
+        out.put("webhookSecretSet", whSet);
+        return out;
+    }
+
+    /**
+     * Direct super-admin write of their OWN RushPay credentials for Ghana
+     * deposits on their branch. Blank fields keep their current value;
+     * clear=true wipes both halves back to the platform keys. Values are
+     * encrypted before storage; audit logs carry only set/unset + last4,
+     * never a value. RushPay needs BOTH halves: the API key (X-API-Key)
+     * creates checkouts, and the webhook secret verifies settlement
+     * webhooks (HMAC) — a key without its webhook secret creates payments
+     * that can never settle by webhook, so both-or-neither like AkwaPay.
+     */
+    @Transactional
+    public Map<String, Object> setRushPayKeys(User sa, String apiKey, String webhookSecret, boolean clear) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can set RushPay credentials for their branch.");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId())
+                .orElseGet(() -> BranchGatewaySetting.builder()
+                        .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
+        var before = rushPayKeyStatus(sa.getId());
+        if (clear) {
+            setting.setGhRushpayApiKey(null);
+            setting.setGhRushpayApiKeyLast4(null);
+            setting.setGhRushpayWebhookSecret(null);
+            setting.setGhRushpayWebhookSecretLast4(null);
+        } else {
+            String ks = requireKeySecret();
+            boolean touched = false;
+            if (apiKey != null && !apiKey.isBlank()) {
+                String v = apiKey.trim();
+                try {
+                    setting.setGhRushpayApiKey(GatewaySecretCrypto.encrypt(v, ks));
+                } catch (Exception e) {
+                    throw ApiException.badRequest("Could not store the API key.");
+                }
+                setting.setGhRushpayApiKeyLast4(v.length() <= 4 ? v : v.substring(v.length() - 4));
+                touched = true;
+            }
+            if (webhookSecret != null && !webhookSecret.isBlank()) {
+                String v = webhookSecret.trim();
+                try {
+                    setting.setGhRushpayWebhookSecret(GatewaySecretCrypto.encrypt(v, ks));
+                } catch (Exception e) {
+                    throw ApiException.badRequest("Could not store the webhook secret.");
+                }
+                setting.setGhRushpayWebhookSecretLast4(v.length() <= 4 ? v : v.substring(v.length() - 4));
+                touched = true;
+            }
+            if (!touched) {
+                throw ApiException.badRequest("Enter an API key, a webhook secret, or use Remove to go back to the platform keys.");
+            }
+        }
+        boolean finalApi = setting.getGhRushpayApiKey() != null && !setting.getGhRushpayApiKey().isBlank();
+        boolean finalWh = setting.getGhRushpayWebhookSecret() != null && !setting.getGhRushpayWebhookSecret().isBlank();
+        if (finalApi != finalWh) {
+            throw ApiException.badRequest("Save both the API key and the webhook secret together — a key without its webhook secret creates payments that can never settle by webhook.");
+        }
+        setting.setUpdatedBy(sa.getId());
+        setting.setUpdatedAt(Instant.now());
+        var saved = settingRepo.save(setting);
+        var after = rushPayKeyStatus(sa.getId());
+        auditService.log(sa.getId(), "SET_RUSHPAY_KEYS", "branch_gateway_settings", saved.getId(),
+                Map.of("apiKeySet", before.get("apiKeySet"),
+                        "apiKeyLast4", String.valueOf(before.get("apiKeyLast4")),
+                        "webhookSecretSet", before.get("webhookSecretSet")),
+                Map.of("apiKeySet", after.get("apiKeySet"),
+                        "apiKeyLast4", String.valueOf(after.get("apiKeyLast4")),
+                        "webhookSecretSet", after.get("webhookSecretSet")), null);
+        return after;
+    }
+
+    /** Decrypted branch RushPay API key, or empty when unset/unreadable. */
+    public Optional<String> branchRushPayApiKey(UUID saId) {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+            if (setting == null || setting.getGhRushpayApiKey() == null
+                    || setting.getGhRushpayApiKey().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhRushpayApiKey(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Decrypted branch RushPay webhook secret, or empty when unset/unreadable. */
+    public Optional<String> branchRushPayWebhookSecret(UUID saId) {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+            if (setting == null || setting.getGhRushpayWebhookSecret() == null
+                    || setting.getGhRushpayWebhookSecret().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhRushpayWebhookSecret(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
     /** Masked PLATFORM AlphaPay key status only — the value is never returned. */
     public Map<String, Object> platformAlphaPayKeyStatus() {
         var row = platformKeyRepo.findById("ALPHAPAY").orElse(null);
@@ -480,6 +592,113 @@ public class GatewayService {
             if (row == null || row.getEncryptedSecretKey() == null
                     || row.getEncryptedSecretKey().isBlank()) return Optional.empty();
             return Optional.of(GatewaySecretCrypto.decrypt(row.getEncryptedSecretKey(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Masked PLATFORM RushPay key status only — the values are never returned. */
+    public Map<String, Object> platformRushPayKeyStatus() {
+        var row = platformKeyRepo.findById("RUSHPAY").orElse(null);
+        boolean apiSet = row != null
+                && row.getEncryptedSecretKey() != null
+                && !row.getEncryptedSecretKey().isBlank();
+        boolean whSet = row != null
+                && row.getEncryptedWebhookSecret() != null
+                && !row.getEncryptedWebhookSecret().isBlank();
+        var out = new LinkedHashMap<String, Object>();
+        out.put("apiKeySet", apiSet);
+        out.put("apiKeyLast4", apiSet ? row.getSecretKeyLast4() : null);
+        out.put("webhookSecretSet", whSet);
+        out.put("webhookSecretLast4", whSet ? row.getWebhookSecretLast4() : null);
+        return out;
+    }
+
+    /**
+     * Site-owner write of the PLATFORM (general) RushPay API key + webhook
+     * secret. Used when a branch has NOT set its own keys. clear=true
+     * deletes the row and goes back to the env keys. Encrypted before
+     * storage; audit logs carry only set/unset + last4, never the values.
+     * Both halves are saved together, like the branch keys.
+     */
+    @Transactional
+    public Map<String, Object> setPlatformRushPayKey(User owner, String apiKey, String webhookSecret, boolean clear) {
+        if (owner == null || owner.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Only the site owner can set the platform RushPay keys.");
+        }
+        var before = platformRushPayKeyStatus();
+        if (clear) {
+            platformKeyRepo.deleteById("RUSHPAY");
+        } else {
+            String ks = requireKeySecret();
+            var existing = platformKeyRepo.findById("RUSHPAY").orElse(null);
+            // Start from the saved row (a blank field keeps its current
+            // value); then the final row must have both halves or neither.
+            String encApi = existing == null ? null : existing.getEncryptedSecretKey();
+            String last4Api = existing == null ? null : existing.getSecretKeyLast4();
+            String encWh = existing == null ? null : existing.getEncryptedWebhookSecret();
+            String last4Wh = existing == null ? null : existing.getWebhookSecretLast4();
+            try {
+                if (apiKey != null && !apiKey.isBlank()) {
+                    String v = apiKey.trim();
+                    encApi = GatewaySecretCrypto.encrypt(v, ks);
+                    last4Api = v.length() <= 4 ? v : v.substring(v.length() - 4);
+                }
+                if (webhookSecret != null && !webhookSecret.isBlank()) {
+                    String v = webhookSecret.trim();
+                    encWh = GatewaySecretCrypto.encrypt(v, ks);
+                    last4Wh = v.length() <= 4 ? v : v.substring(v.length() - 4);
+                }
+            } catch (Exception e) {
+                throw ApiException.badRequest("Could not store the RushPay keys.");
+            }
+            if ((encApi == null || encApi.isBlank()) != (encWh == null || encWh.isBlank())) {
+                throw ApiException.badRequest("Save both the API key and the webhook secret together — a key without its webhook secret creates payments that can never settle by webhook.");
+            }
+            if (encApi == null || encApi.isBlank()) {
+                throw ApiException.badRequest("Enter the RushPay API key and webhook secret, or use Remove to go back to the env keys.");
+            }
+            platformKeyRepo.save(PlatformGatewayKey.builder()
+                    .gateway("RUSHPAY")
+                    .encryptedSecretKey(encApi)
+                    .secretKeyLast4(last4Api)
+                    .encryptedWebhookSecret(encWh)
+                    .webhookSecretLast4(last4Wh)
+                    .updatedAt(Instant.now())
+                    .build());
+        }
+        var after = platformRushPayKeyStatus();
+        auditService.log(owner.getId(), "SET_PLATFORM_RUSHPAY_KEYS", "platform_gateway_keys", null,
+                Map.of("apiKeySet", before.get("apiKeySet"),
+                        "apiKeyLast4", String.valueOf(before.get("apiKeyLast4")),
+                        "webhookSecretSet", before.get("webhookSecretSet")),
+                Map.of("apiKeySet", after.get("apiKeySet"),
+                        "apiKeyLast4", String.valueOf(after.get("apiKeyLast4")),
+                        "webhookSecretSet", after.get("webhookSecretSet")), null);
+        return after;
+    }
+
+    /** Decrypted PLATFORM RushPay API key, or empty when unset/unreadable. */
+    public Optional<String> platformRushPayApiKey() {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var row = platformKeyRepo.findById("RUSHPAY").orElse(null);
+            if (row == null || row.getEncryptedSecretKey() == null
+                    || row.getEncryptedSecretKey().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(row.getEncryptedSecretKey(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Decrypted PLATFORM RushPay webhook secret, or empty when unset/unreadable. */
+    public Optional<String> platformRushPayWebhookSecret() {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var row = platformKeyRepo.findById("RUSHPAY").orElse(null);
+            if (row == null || row.getEncryptedWebhookSecret() == null
+                    || row.getEncryptedWebhookSecret().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(row.getEncryptedWebhookSecret(), gatewayKeySecret));
         } catch (Exception e) {
             return Optional.empty();
         }
@@ -619,8 +838,8 @@ public class GatewayService {
 
     /**
      * Direct super-admin write of their OWN branch's gateways — no site
-     * owner approval. Ghana is AkwaPay only (the only Ghana gateway the
-     * deposit page offers); Nigeria is MANUAL (manual bank transfer) or
+     * owner approval. Ghana is any ALLOWED_GH gateway (AkwaPay, AlphaPay,
+     * RushPay); Nigeria is MANUAL (manual bank transfer) or
      * FLUTTERWAVE (Flutterwave v3 + v4: bank transfer, USSD, card, Opay).
      * At least one side must be supplied; the other side keeps its
      * current value. A pending gateway request is left alone: the owner
@@ -634,10 +853,10 @@ public class GatewayService {
         }
         String ghV = null, ngV = null;
         if (gh != null && !gh.isBlank()) {
-            ghV = gh.trim().toUpperCase();
-            if (!"AKWAPAY".equals(ghV)) {
-                throw ApiException.badRequest("Ghana gateway is AkwaPay.");
-            }
+            // v160: restored the v148 fix (v152's stale base reverted it to
+            // AKWAPAY-only, so the SA toggle to AlphaPay/RushPay 400'd live).
+            // Validate against ALLOWED_GH like every other setter, via optGh.
+            ghV = optGh(gh);
         }
         if (ng != null && !ng.isBlank()) {
             ngV = ng.trim().toUpperCase();

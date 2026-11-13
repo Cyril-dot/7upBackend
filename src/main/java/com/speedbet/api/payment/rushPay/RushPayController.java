@@ -1,6 +1,7 @@
 package com.speedbet.api.payment.rushPay;
 
 import com.speedbet.api.chat.AdminUpgradeChatService;
+import com.speedbet.api.gateway.GatewayService;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.referral.ReferralService;
@@ -97,6 +98,7 @@ public class RushPayController {
     private final ConcurrentHashMap<String, UUID> pendingRefs = new ConcurrentHashMap<>();
 
     private final WalletService           walletService;
+    private final GatewayService          gatewayService;
     private final UserService             userService;
     private final AdminUpgradeChatService adminUpgradeChatService;
     private final ReferralService         referralService;
@@ -108,7 +110,7 @@ public class RushPayController {
     @Value("${app.rushpay.base-url}")                private String     baseUrl;
     @Value("${app.rushpay.signature-header:x-rushpay-signature}") private String signatureHeader;
     @Value("${app.platform.min-deposit-amount:300}") private BigDecimal minDeposit;
-    @Value("${app.platform.frontend-url}")           private String     frontendUrl;
+    @Value("${app.rushpay.return-url}")               private String     returnUrl;
 
     // ─── Deposit Init ─────────────────────────────────────────────────────────
 
@@ -127,15 +129,17 @@ public class RushPayController {
             @RequestBody Map<String, Object> req) {
 
         var amount = new BigDecimal(req.get("amount").toString());
-        if (amount.compareTo(minDeposit) < 0)
-            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        var effMin = branchGhMinDeposit(user);
+        if (amount.compareTo(effMin) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + effMin.stripTrailingZeros().toPlainString());
 
         log.info("initDeposit: userId='{}' amount={}", user.getId(), amount);
 
         var session = createCheckoutAndSession(
+                apiKeyFor(user),
                 amount,
                 "Wallet deposit",
-                frontendUrl + "/app/wallet?payment=success",
+                returnUrl,
                 Map.of("userId", user.getId().toString())
         );
 
@@ -162,9 +166,10 @@ public class RushPayController {
                 .divide(BigDecimal.valueOf(100), MC);
 
         var session = createCheckoutAndSession(
+                apiKeyFor(user),
                 amount,
                 "Admin upgrade fee",
-                frontendUrl + "/app/upgrade?payment=success",
+                returnUrl,
                 Map.of(
                         "userId",        user.getId().toString(),
                         "upgradeIntent", UPGRADE_INTENT_ADMIN
@@ -211,7 +216,7 @@ public class RushPayController {
 
         log.info("depositStatus: userId='{}' ref='{}'", user.getId(), ref);
 
-        var statusResponse = rushpayGetStatus(ref);
+        var statusResponse = rushpayGetStatus(apiKeyFor(user), ref);
 
         @SuppressWarnings("unchecked")
         var data = (Map<String, Object>) statusResponse.get("data");
@@ -268,7 +273,29 @@ public class RushPayController {
             return ResponseEntity.status(400).body("Missing signature");
         }
 
-        if (!verifySignature(rawBody, signature)) {
+        // Resolve the signing secret for this payment: the metadata userId
+        // tells us whose branch it belongs to, so a branch that set its own
+        // RushPay keys verifies with that webhook secret; everyone else uses
+        // the platform secret, then the env secret. (The userId is only used
+        // for routing here — nothing is credited until the signature passes
+        // AND the status poll below confirms completion server-to-server.)
+        var webhookKey = webhookSecret;
+        try {
+            @SuppressWarnings("unchecked")
+            var peek = (Map<String, Object>) objectMapper
+                    .readValue(new String(rawBody, StandardCharsets.UTF_8), Map.class);
+            @SuppressWarnings("unchecked")
+            var peekData = peek.get("data") instanceof Map<?, ?> pd ? (Map<String, Object>) pd : null;
+            @SuppressWarnings("unchecked")
+            var peekMeta = peekData != null && peekData.get("metadata") instanceof Map<?, ?> pm
+                    ? (Map<String, Object>) pm : null;
+            if (peekMeta != null && peekMeta.get("userId") != null) {
+                var uid = UUID.fromString(peekMeta.get("userId").toString());
+                webhookKey = webhookSecretForUserId(uid);
+            }
+        } catch (Exception ignored) { }
+
+        if (!verifySignature(rawBody, signature, webhookKey)) {
             log.warn("RushPay webhook: invalid signature received");
             return ResponseEntity.status(400).body("Invalid signature");
         }
@@ -397,16 +424,86 @@ public class RushPayController {
         log.info("handleAdminUpgrade: upgrade chat created for userId='{}'", userId);
     }
 
+    // ─── RushPay key resolution (v160) ───────────────────────────────────────
+    // A super admin can set their OWN RushPay API key + webhook secret for
+    // their branch (GatewayService.setRushPayKeys). When set, deposits from
+    // users on that branch run on the super admin's RushPay account;
+    // otherwise the platform keys (site owner, in the app) are used, then
+    // the Railway env keys. Mirrors the AlphaPay branch-key pattern, except
+    // RushPay has TWO secrets: the API key (X-API-Key) and a separate
+    // webhook secret (HMAC over the raw webhook body).
+    private String apiKeyFor(User user) {
+        if (user != null) {
+            try {
+                var saId = gatewayService.resolveBranchSuperAdmin(user);
+                if (saId.isPresent()) {
+                    var branch = gatewayService.branchRushPayApiKey(saId.get());
+                    if (branch.isPresent()) return branch.get();
+                }
+            } catch (Exception e) {
+                log.warn("RushPay key resolution fell back to platform key: {}", e.getMessage());
+            }
+        }
+        var platform = gatewayService.platformRushPayApiKey();
+        if (platform.isPresent()) return platform.get();
+        return apiKey;
+    }
+
+    private String apiKeyForUserId(UUID userId) {
+        try {
+            var saId = gatewayService.resolveBranchSuperAdminId(userId);
+            if (saId.isPresent()) {
+                var branch = gatewayService.branchRushPayApiKey(saId.get());
+                if (branch.isPresent()) return branch.get();
+            }
+        } catch (Exception e) {
+            log.warn("RushPay webhook key resolution fell back to platform key: {}", e.getMessage());
+        }
+        var platform = gatewayService.platformRushPayApiKey();
+        if (platform.isPresent()) return platform.get();
+        return apiKey;
+    }
+
+    private String webhookSecretForUserId(UUID userId) {
+        try {
+            var saId = gatewayService.resolveBranchSuperAdminId(userId);
+            if (saId.isPresent()) {
+                var branch = gatewayService.branchRushPayWebhookSecret(saId.get());
+                if (branch.isPresent()) return branch.get();
+            }
+        } catch (Exception e) {
+            log.warn("RushPay webhook secret resolution fell back to platform secret: {}", e.getMessage());
+        }
+        var platform = gatewayService.platformRushPayWebhookSecret();
+        if (platform.isPresent()) return platform.get();
+        return webhookSecret;
+    }
+
+    // Branch-effective Ghana deposit minimum: the branch super admin's
+    // setting, else the platform env default. Falls back to minDeposit
+    // if the branch lookup fails, so a gateway hiccup can never block
+    // deposits. (Same rule as the AkwaPay init.)
+    private BigDecimal branchGhMinDeposit(User user) {
+        try {
+            var v = gatewayService.branchLimitsFor(user).get("ghMinDeposit");
+            if (v instanceof BigDecimal bd) return bd;
+            if (v != null) return new BigDecimal(v.toString());
+        } catch (Exception e) {
+            log.warn("branchGhMinDeposit: falling back to platform minimum");
+        }
+        return minDeposit;
+    }
+
     // ─── RushPay API helpers ──────────────────────────────────────────────────
 
     /**
      * Creates a RushPay checkout then a widget session.
      * Returns { payment_reference, widget_session_token } for the frontend.
      */
-    private Map<String, Object> createCheckoutAndSession(BigDecimal amount, String description,
+    private Map<String, Object> createCheckoutAndSession(String apiKey, BigDecimal amount, String description,
                                                          String callbackUrl,
                                                          Map<String, Object> metadata) {
-        var create = rushpayPost("/api/v1/merchant/payments/create", Map.of(
+        var create = rushpayPost(apiKey, "/api/v1/merchant/payments/create", Map.of(
                 "amount",       amount.toPlainString(),
                 "description",  description,
                 "callback_url", callbackUrl,
@@ -419,7 +516,7 @@ public class RushPayController {
 
         log.info("createCheckoutAndSession: ref='{}' calling widget-session", paymentReference);
 
-        var sessionResp = rushpayPost("/api/v1/merchant/payments/widget-session", Map.of(
+        var sessionResp = rushpayPost(apiKey, "/api/v1/merchant/payments/widget-session", Map.of(
                 "payment_reference", paymentReference
         ));
 
@@ -436,7 +533,10 @@ public class RushPayController {
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> rushpayPost(String path, Map<String, Object> body) {
+    private Map<String, Object> rushpayPost(String apiKey, String path, Map<String, Object> body) {
+        if (apiKey == null || apiKey.isBlank()) {
+            throw ApiException.badRequest("RushPay is not set up for this branch yet — save your RushPay API key in the Gateways tab, or ask the platform owner to set the platform keys.");
+        }
         var result = (Map<String, Object>) webClientBuilder.build()
                 .post().uri(baseUrl + path)
                 .header("X-API-Key", apiKey)
@@ -482,7 +582,10 @@ public class RushPayController {
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> rushpayGetStatus(String paymentReference) {
+    private Map<String, Object> rushpayGetStatus(String apiKey, String paymentReference) {
+        if (apiKey == null || apiKey.isBlank()) {
+            throw ApiException.badRequest("RushPay is not set up for this branch yet — save your RushPay API key in the Gateways tab, or ask the platform owner to set the platform keys.");
+        }
         var result = (Map<String, Object>) webClientBuilder.build()
                 .get().uri(baseUrl + "/api/v1/merchant/payments/status?payment_reference=" + paymentReference)
                 .header("X-API-Key", apiKey)
@@ -535,11 +638,12 @@ public class RushPayController {
 
     // ─── Signature verification ───────────────────────────────────────────────
 
-    private boolean verifySignature(byte[] rawBody, String signature) {
+    private boolean verifySignature(byte[] rawBody, String signature, String secret) {
         try {
+            if (secret == null || secret.isBlank()) return false;
             var mac = Mac.getInstance("HmacSHA512");
             mac.init(new SecretKeySpec(
-                    webhookSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA512"));
+                    secret.getBytes(StandardCharsets.UTF_8), "HmacSHA512"));
             var expected = java.util.HexFormat.of().formatHex(mac.doFinal(rawBody));
             return constantTimeEquals(expected, signature.trim());
         } catch (Exception e) {

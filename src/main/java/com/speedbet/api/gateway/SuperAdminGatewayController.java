@@ -48,6 +48,7 @@ public class SuperAdminGatewayController {
         out.put("active", active);
         out.put("ghanaKeys", gatewayService.ghanaKeyStatus(actor.getId()));
         out.put("alphaPayKeys", gatewayService.alphaPayKeyStatus(actor.getId()));
+        out.put("rushPayKeys", gatewayService.rushPayKeyStatus(actor.getId()));
         out.put("pendingRequest", pending);
         out.put("allowedGh", GatewayService.ALLOWED_GH);
         out.put("allowedNg", GatewayService.ALLOWED_NG);
@@ -120,6 +121,28 @@ public class SuperAdminGatewayController {
         return ResponseEntity.ok(ApiResponse.ok(saved,
                 clear ? "Your own AlphaPay key was removed. Ghana deposits on your branch now use the platform key."
                         : "Your own AlphaPay key was saved. Ghana deposits on your branch now run on your AlphaPay account."));
+    }
+
+    /**
+     * Direct set of the branch's OWN RushPay credentials for Ghana
+     * deposits. Blank fields keep their current value; clear=true wipes
+     * both halves back to the platform keys. Values are stored encrypted
+     * and never returned — the response carries set/unset + last4 only.
+     * RushPay needs both halves (API key + webhook secret) together.
+     */
+    @PutMapping("/rushpay-keys")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setRushPayKeys(
+            @AuthenticationPrincipal User actor,
+            @RequestBody Map<String, Object> req) {
+        requireSuperAdmin(actor);
+        boolean clear = Boolean.TRUE.equals(req.get("clear"));
+        var saved = gatewayService.setRushPayKeys(actor,
+                req.get("apiKey") == null ? null : req.get("apiKey").toString(),
+                req.get("webhookSecret") == null ? null : req.get("webhookSecret").toString(),
+                clear);
+        return ResponseEntity.ok(ApiResponse.ok(saved,
+                clear ? "Your own RushPay keys were removed. Ghana deposits on your branch now use the platform keys."
+                        : "Your own RushPay keys were saved. Ghana deposits on your branch now run on your RushPay account."));
     }
 
     /**
