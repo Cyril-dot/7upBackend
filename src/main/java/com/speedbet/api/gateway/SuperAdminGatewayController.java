@@ -47,6 +47,7 @@ public class SuperAdminGatewayController {
         var out = new LinkedHashMap<String, Object>();
         out.put("active", active);
         out.put("ghanaKeys", gatewayService.ghanaKeyStatus(actor.getId()));
+        out.put("alphaPayKeys", gatewayService.alphaPayKeyStatus(actor.getId()));
         out.put("pendingRequest", pending);
         out.put("allowedGh", GatewayService.ALLOWED_GH);
         out.put("allowedNg", GatewayService.ALLOWED_NG);
@@ -98,6 +99,27 @@ public class SuperAdminGatewayController {
         return ResponseEntity.ok(ApiResponse.ok(saved,
                 clear ? "Your own AkwaPay keys were removed. Ghana deposits on your branch now use the platform key."
                         : "Your own AkwaPay keys were saved. Ghana deposits on your branch now run on your AkwaPay account."));
+    }
+
+    /**
+     * Direct set of the branch's OWN AlphaPay secret key for Ghana
+     * deposits. Blank keeps the current value; clear=true wipes it back
+     * to the platform key. The key is stored encrypted and never returned
+     * — the response carries set/unset + last4 only. AlphaPay uses this
+     * one secret for the Bearer auth AND the webhook HMAC.
+     */
+    @PutMapping("/alphapay-key")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setAlphaPayKey(
+            @AuthenticationPrincipal User actor,
+            @RequestBody Map<String, Object> req) {
+        requireSuperAdmin(actor);
+        boolean clear = Boolean.TRUE.equals(req.get("clear"));
+        var saved = gatewayService.setAlphaPayKey(actor,
+                req.get("secretKey") == null ? null : req.get("secretKey").toString(),
+                clear);
+        return ResponseEntity.ok(ApiResponse.ok(saved,
+                clear ? "Your own AlphaPay key was removed. Ghana deposits on your branch now use the platform key."
+                        : "Your own AlphaPay key was saved. Ghana deposits on your branch now run on your AlphaPay account."));
     }
 
     /**

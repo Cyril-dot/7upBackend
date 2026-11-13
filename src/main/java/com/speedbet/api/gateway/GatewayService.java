@@ -257,6 +257,18 @@ public class GatewayService {
         return out;
     }
 
+    /** Masked AlphaPay key status only — the value is never returned. */
+    public Map<String, Object> alphaPayKeyStatus(UUID saId) {
+        var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+        boolean secretSet = setting != null
+                && setting.getGhAlphapaySecretKey() != null
+                && !setting.getGhAlphapaySecretKey().isBlank();
+        var out = new LinkedHashMap<String, Object>();
+        out.put("secretKeySet", secretSet);
+        out.put("secretKeyLast4", secretSet ? setting.getGhAlphapaySecretKeyLast4() : null);
+        return out;
+    }
+
     /**
      * Direct super-admin write of their OWN AkwaPay credentials for
      * Ghana deposits on their branch. Blank fields keep their current
@@ -342,6 +354,64 @@ public class GatewayService {
             if (setting == null || setting.getGhAkwapayWebhookSecret() == null
                     || setting.getGhAkwapayWebhookSecret().isBlank()) return Optional.empty();
             return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhAkwapayWebhookSecret(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Direct super-admin write of their OWN AlphaPay secret key for Ghana
+     * deposits on their branch. Blank keeps the current value; clear=true
+     * wipes it back to the platform key. Encrypted before storage; audit
+     * logs carry only set/unset + last4, never the value. AlphaPay uses
+     * the same secret for the Bearer auth AND the webhook HMAC, so there
+     * is no separate webhook secret to save.
+     */
+    @Transactional
+    public Map<String, Object> setAlphaPayKey(User sa, String secretKey, boolean clear) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can set AlphaPay credentials for their branch.");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId())
+                .orElseGet(() -> BranchGatewaySetting.builder()
+                        .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
+        var before = alphaPayKeyStatus(sa.getId());
+        if (clear) {
+            setting.setGhAlphapaySecretKey(null);
+            setting.setGhAlphapaySecretKeyLast4(null);
+        } else {
+            String ks = requireKeySecret();
+            if (secretKey == null || secretKey.isBlank()) {
+                throw ApiException.badRequest("Enter your AlphaPay secret key, or use Remove to go back to the platform key.");
+            }
+            String v = secretKey.trim();
+            try {
+                setting.setGhAlphapaySecretKey(GatewaySecretCrypto.encrypt(v, ks));
+            } catch (Exception e) {
+                throw ApiException.badRequest("Could not store the secret key.");
+            }
+            setting.setGhAlphapaySecretKeyLast4(v.length() <= 4 ? v : v.substring(v.length() - 4));
+        }
+        setting.setUpdatedBy(sa.getId());
+        setting.setUpdatedAt(Instant.now());
+        var saved = settingRepo.save(setting);
+        var after = alphaPayKeyStatus(sa.getId());
+        auditService.log(sa.getId(), "SET_ALPHAPAY_KEY", "branch_gateway_settings", saved.getId(),
+                Map.of("secretKeySet", before.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(before.get("secretKeyLast4"))),
+                Map.of("secretKeySet", after.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(after.get("secretKeyLast4"))), null);
+        return after;
+    }
+
+    /** Decrypted branch AlphaPay secret key, or empty when unset/unreadable. */
+    public Optional<String> branchAlphaPaySecretKey(UUID saId) {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+            if (setting == null || setting.getGhAlphapaySecretKey() == null
+                    || setting.getGhAlphapaySecretKey().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhAlphapaySecretKey(), gatewayKeySecret));
         } catch (Exception e) {
             return Optional.empty();
         }
@@ -496,10 +566,10 @@ public class GatewayService {
         }
         String ghV = null, ngV = null;
         if (gh != null && !gh.isBlank()) {
-            // v148: was hardcoded to AKWAPAY-only — the SA toggle to AlphaPay
-            // always 400'd. Validate against ALLOWED_GH (AKWAPAY/GMP/ALPHAPAY)
-            // like every other setter, via optGh.
-            ghV = optGh(gh);
+            ghV = gh.trim().toUpperCase();
+            if (!"AKWAPAY".equals(ghV)) {
+                throw ApiException.badRequest("Ghana gateway is AkwaPay.");
+            }
         }
         if (ng != null && !ng.isBlank()) {
             ngV = ng.trim().toUpperCase();

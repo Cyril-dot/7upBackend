@@ -3,6 +3,7 @@ package com.speedbet.api.payment.alphapay;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
+import com.speedbet.api.gateway.GatewayService;
 import com.speedbet.api.referral.ReferralService;
 import com.speedbet.api.user.User;
 import com.speedbet.api.wallet.TxKind;
@@ -78,6 +79,7 @@ public class AlphaPayController {
     private final ReferralService   referralService;
     private final WebClient.Builder webClientBuilder;
     private final ObjectMapper      objectMapper;
+    private final GatewayService    gatewayService;
 
     @Value("${app.alphapay.secret-key}")           private String     secretKey;
     @Value("${app.alphapay.base-url}")             private String     baseUrl;          // https://api.edibytes.online/api
@@ -119,7 +121,7 @@ public class AlphaPayController {
         log.info("[AlphaPay][init] Calling initialize — userId='{}' ref='{}' amountGHS={} phone='{}'",
                 user.getId(), reference, amount, phone == null ? "-" : maskPhone(phone));
 
-        var response = callAlphaPay(HttpMethod.POST, "/payments/initialize/", body, true, "init");
+        var response = callAlphaPay(HttpMethod.POST, "/payments/initialize/", body, true, "init", secretKeyFor(user));
 
         log.info("[AlphaPay][init] DONE — userId='{}' ref='{}' status='{}' hasCheckoutUrl={}",
                 user.getId(), reference, response.get("status"), response.get("checkout_url") != null);
@@ -145,7 +147,7 @@ public class AlphaPayController {
 
         // verify-otp is unauthenticated on AlphaPay's side (scoped by reference)
         var response = callAlphaPay(HttpMethod.POST, "/payments/" + reference + "/verify-otp/",
-                Map.of("code", code), false, "submitOtp");
+                Map.of("code", code), false, "submitOtp", secretKey);
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
@@ -163,7 +165,7 @@ public class AlphaPayController {
         assertReferenceBelongsTo(user, reference);
         log.info("[AlphaPay][verify] userId='{}' ref='{}'", user.getId(), reference);
 
-        var result = alphaPayVerify(reference);
+        var result = alphaPayVerify(reference, secretKeyFor(user));
         var status = String.valueOf(result.get("status"));
 
         if ("success".equals(status)) {
@@ -195,12 +197,31 @@ public class AlphaPayController {
             return ResponseEntity.status(400).body("Failed to read body");
         }
 
-        // 2. Signature
+        // 2. Signature present?
         if (signature == null || signature.isBlank()) {
             log.warn("[AlphaPay][Webhook] REJECTED — missing X-AlphaPay-Signature");
             return ResponseEntity.status(400).body("Missing signature");
         }
-        if (!verifySignature(rawBody, signature.trim())) {
+
+        // 3. Resolve the signing key for this payment: the reference tells us
+        // whose branch it belongs to, so a branch that set its own AlphaPay
+        // key verifies with that key; everyone else uses the platform key.
+        // (The reference is only used for routing here — nothing is credited
+        // until the signature passes AND the server-to-server verify below.)
+        UUID refUserId = null;
+        try {
+            @SuppressWarnings("unchecked")
+            var peek = (Map<String, Object>) objectMapper
+                    .readValue(new String(rawBody, StandardCharsets.UTF_8), Map.class);
+            @SuppressWarnings("unchecked")
+            var peekData = peek.get("data") instanceof Map<?, ?> pd ? (Map<String, Object>) pd : null;
+            if (peekData != null && peekData.get("reference") != null) {
+                refUserId = parseUserIdFromReference(peekData.get("reference").toString().trim());
+            }
+        } catch (Exception ignored) { }
+        var key = refUserId != null ? secretKeyForUserId(refUserId) : secretKey;
+
+        if (!verifySignature(rawBody, signature.trim(), key)) {
             log.warn("[AlphaPay][Webhook] REJECTED — HMAC mismatch (wrong secret key?)");
             return ResponseEntity.status(400).body("Invalid signature");
         }
@@ -233,7 +254,7 @@ public class AlphaPayController {
             }
 
             // Never credit from the webhook body — confirm with AlphaPay server-to-server.
-            var verified = alphaPayVerify(ref);
+            var verified = alphaPayVerify(ref, key);
             var status   = String.valueOf(verified.get("status"));
             if (!"success".equals(status)) {
                 log.warn("[AlphaPay][Webhook] Verify says status='{}' for ref='{}' — NOT crediting", status, ref);
@@ -266,6 +287,39 @@ public class AlphaPayController {
             target = returnUrl + (returnUrl.contains("?") ? "&" : "?") + "reference=" + reference;
         }
         return ResponseEntity.status(302).location(URI.create(target)).build();
+    }
+
+    // ─── AlphaPay key resolution ─────────────────────────────────────────────
+    // A super admin can set their OWN AlphaPay secret key for their branch
+    // (GatewayService.setAlphaPayKey). When set, deposits from users on
+    // that branch run on the super admin's AlphaPay account; otherwise the
+    // platform key (env) is used. Mirrors the AkwaPay branch-key pattern.
+    private String secretKeyFor(User user) {
+        if (user != null) {
+            try {
+                var saId = gatewayService.resolveBranchSuperAdmin(user);
+                if (saId.isPresent()) {
+                    var branch = gatewayService.branchAlphaPaySecretKey(saId.get());
+                    if (branch.isPresent()) return branch.get();
+                }
+            } catch (Exception e) {
+                log.warn("AlphaPay key resolution fell back to platform key: {}", e.getMessage());
+            }
+        }
+        return secretKey;
+    }
+
+    private String secretKeyForUserId(UUID userId) {
+        try {
+            var saId = gatewayService.resolveBranchSuperAdminId(userId);
+            if (saId.isPresent()) {
+                var branch = gatewayService.branchAlphaPaySecretKey(saId.get());
+                if (branch.isPresent()) return branch.get();
+            }
+        } catch (Exception e) {
+            log.warn("AlphaPay webhook key resolution fell back to platform key: {}", e.getMessage());
+        }
+        return secretKey;
     }
 
     // ─── Wallet crediting ──────────────────────────────────────────────────────
@@ -322,10 +376,10 @@ public class AlphaPayController {
 
     // ─── AlphaPay API calls ────────────────────────────────────────────────────
 
-    private Map<String, Object> alphaPayVerify(String reference) {
+    private Map<String, Object> alphaPayVerify(String reference, String key) {
         if (!REF_PATTERN.matcher(reference).matches())
             throw ApiException.badRequest("Invalid reference.");
-        return callAlphaPay(HttpMethod.GET, "/payments/verify/" + reference + "/", null, true, "verify");
+        return callAlphaPay(HttpMethod.GET, "/payments/verify/" + reference + "/", null, true, "verify", key);
     }
 
     private static class UpstreamException extends RuntimeException {
@@ -340,13 +394,13 @@ public class AlphaPayController {
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> callAlphaPay(HttpMethod method, String path, Object body,
-                                             boolean auth, String tag) {
+                                             boolean auth, String tag, String key) {
         var spec = webClientBuilder.build()
                 .method(method)
                 .uri(baseUrl + path)
                 .accept(MediaType.APPLICATION_JSON);
 
-        if (auth) spec = spec.header(HttpHeaders.AUTHORIZATION, "Bearer " + secretKey);
+        if (auth) spec = spec.header(HttpHeaders.AUTHORIZATION, "Bearer " + key);
         var withBody = body != null
                 ? spec.contentType(MediaType.APPLICATION_JSON).bodyValue(body)
                 : spec;
@@ -459,10 +513,10 @@ public class AlphaPayController {
 
     // ─── Signature ─────────────────────────────────────────────────────────────
 
-    private boolean verifySignature(byte[] rawBody, String signature) {
+    private boolean verifySignature(byte[] rawBody, String signature, String key) {
         try {
             var mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            mac.init(new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
             var computed = HexFormat.of().formatHex(mac.doFinal(rawBody));
             // constant-time compare
             return MessageDigest.isEqual(
