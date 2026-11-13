@@ -395,6 +395,9 @@ public class AlphaPayController {
     @SuppressWarnings("unchecked")
     private Map<String, Object> callAlphaPay(HttpMethod method, String path, Object body,
                                              boolean auth, String tag, String key) {
+        if (auth && (key == null || key.isBlank())) {
+            throw ApiException.badRequest("AlphaPay is not set up for this branch yet — save your AlphaPay secret key in the Gateways tab, or ask the platform owner to set the platform key.");
+        }
         var spec = webClientBuilder.build()
                 .method(method)
                 .uri(baseUrl + path)
@@ -428,7 +431,7 @@ public class AlphaPayController {
         try {
             result = (Map<String, Object>) mono.block();
         } catch (UpstreamException e) {
-            if (e.status == 400) throw ApiException.badRequest(extractErrorMessage(e.body));
+            if (e.status >= 400 && e.status < 500) throw ApiException.badRequest(extractErrorMessage(e.body));
             throw new RuntimeException("AlphaPay is currently unavailable. Please try again.", e);
         } catch (Exception e) {
             log.error("[AlphaPay][{}] call failed — {}", tag, e.getMessage(), e);
@@ -439,14 +442,18 @@ public class AlphaPayController {
         return result;
     }
 
-    /** AlphaPay errors look like { "error": { "type": "...", "message": "..." } } */
+    /** AlphaPay errors look like { "error": { "type": "...", "message": "..." } }.
+     * Auth/domain errors may instead carry a top-level "message" or "detail". */
     @SuppressWarnings("unchecked")
     private String extractErrorMessage(String rawBody) {
         try {
             var parsed = (Map<String, Object>) objectMapper.readValue(rawBody, Map.class);
             if (parsed.get("error") instanceof Map<?, ?> err && err.get("message") != null)
                 return err.get("message").toString();
+            if (parsed.get("message") != null) return parsed.get("message").toString();
+            if (parsed.get("detail") != null) return parsed.get("detail").toString();
         } catch (Exception ignored) { }
+        if (rawBody != null && !rawBody.isBlank() && rawBody.length() < 200) return rawBody.trim();
         return "Payment request was rejected.";
     }
 
