@@ -48,11 +48,13 @@ import java.util.regex.Pattern;
 /**
  * AlphaPay (https://alphapay.edibytes.online/docs) mobile-money deposit integration.
  *
- * Flow:
- *  1. POST /api/wallet/deposit/alphapay/init        -> returns checkout_url (redirect the customer there)
- *  2. (optional) POST .../submit-otp                -> only if you build your own OTP form
- *  3. Customer approves on phone; AlphaPay POSTs webhook to /api/webhooks/alphapay
- *  4. GET  /api/wallet/deposit/alphapay/verify/{ref} -> frontend poll / fallback; also credits (idempotent)
+ * Flow (direct MoMo push ONLY — no hosted checkout, no OTP, no USSD):
+ *  1. POST /api/wallet/deposit/alphapay/init        -> dispatches the MoMo prompt
+ *     straight to the phone; the customer approves with their MoMo PIN.
+ *     Needs OTP verification switched OFF on the AlphaPay account; if AlphaPay
+ *     still returns a checkout_url, the frontend says so instead of redirecting.
+ *  2. Customer approves on phone; AlphaPay POSTs webhook to /api/webhooks/alphapay
+ *  3. GET  /api/wallet/deposit/alphapay/verify/{ref} -> frontend poll / fallback; also credits (idempotent)
  *
  * Security model:
  *  - Webhook identity = HMAC-SHA256 over raw body, keyed with secret key (X-AlphaPay-Signature).
@@ -134,29 +136,6 @@ public class AlphaPayController {
 
         log.info("[AlphaPay][init] DONE — userId='{}' ref='{}' status='{}' hasCheckoutUrl={}",
                 user.getId(), reference, response.get("status"), response.get("checkout_url") != null);
-
-        return ResponseEntity.ok(ApiResponse.ok(response));
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Step 2 (optional) — Submit OTP from YOUR OWN form.
-    // Not needed if you redirect to checkout_url (hosted page does this itself).
-    // Body: { "reference": "DEP_...", "code": "1234" }
-    // ═══════════════════════════════════════════════════════════════════════════
-    @PostMapping("/api/wallet/deposit/alphapay/submit-otp")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> submitOtp(
-            @AuthenticationPrincipal User user,
-            @RequestBody Map<String, Object> req) {
-
-        var reference = requireNonBlank(req, "reference");
-        var code      = requireNonBlank(req, "code");
-        assertReferenceBelongsTo(user, reference);
-
-        log.info("[AlphaPay][submitOtp] userId='{}' ref='{}'", user.getId(), reference);
-
-        // verify-otp is unauthenticated on AlphaPay's side (scoped by reference)
-        var response = callAlphaPay(HttpMethod.POST, "/payments/" + reference + "/verify-otp/",
-                Map.of("code", code), false, "submitOtp", secretKey);
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
