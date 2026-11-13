@@ -59,6 +59,7 @@ public class GatewayService {
     public static final Set<String> ALLOWED_NG = Set.of("GMP", "KORAPAY", "MANUAL", "FLUTTERWAVE");
 
     private final BranchGatewaySettingRepository settingRepo;
+    private final PlatformGatewayKeyRepository platformKeyRepo;
     private final GatewayRequestRepository requestRepo;
     private final UserRepository userRepo;
     private final ReferralLinkRepository linkRepo;
@@ -412,6 +413,73 @@ public class GatewayService {
             if (setting == null || setting.getGhAlphapaySecretKey() == null
                     || setting.getGhAlphapaySecretKey().isBlank()) return Optional.empty();
             return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhAlphapaySecretKey(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Masked PLATFORM AlphaPay key status only — the value is never returned. */
+    public Map<String, Object> platformAlphaPayKeyStatus() {
+        var row = platformKeyRepo.findById("ALPHAPAY").orElse(null);
+        boolean secretSet = row != null
+                && row.getEncryptedSecretKey() != null
+                && !row.getEncryptedSecretKey().isBlank();
+        var out = new LinkedHashMap<String, Object>();
+        out.put("secretKeySet", secretSet);
+        out.put("secretKeyLast4", secretSet ? row.getSecretKeyLast4() : null);
+        return out;
+    }
+
+    /**
+     * Site-owner write of the PLATFORM (general) AlphaPay secret key.
+     * Used when a branch has NOT set its own key. clear=true deletes the
+     * row and goes back to the env key. Encrypted before storage; audit
+     * logs carry only set/unset + last4, never the value.
+     */
+    @Transactional
+    public Map<String, Object> setPlatformAlphaPayKey(User owner, String secretKey, boolean clear) {
+        if (owner == null || owner.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Only the site owner can set the platform AlphaPay key.");
+        }
+        var before = platformAlphaPayKeyStatus();
+        if (clear) {
+            platformKeyRepo.deleteById("ALPHAPAY");
+        } else {
+            String ks = requireKeySecret();
+            if (secretKey == null || secretKey.isBlank()) {
+                throw ApiException.badRequest("Enter the AlphaPay secret key, or use Remove to go back to the env key.");
+            }
+            String v = secretKey.trim();
+            PlatformGatewayKey row;
+            try {
+                row = PlatformGatewayKey.builder()
+                        .gateway("ALPHAPAY")
+                        .encryptedSecretKey(GatewaySecretCrypto.encrypt(v, ks))
+                        .secretKeyLast4(v.length() <= 4 ? v : v.substring(v.length() - 4))
+                        .updatedAt(Instant.now())
+                        .build();
+            } catch (Exception e) {
+                throw ApiException.badRequest("Could not store the secret key.");
+            }
+            platformKeyRepo.save(row);
+        }
+        var after = platformAlphaPayKeyStatus();
+        auditService.log(owner.getId(), "SET_PLATFORM_ALPHAPAY_KEY", "platform_gateway_keys", null,
+                Map.of("secretKeySet", before.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(before.get("secretKeyLast4"))),
+                Map.of("secretKeySet", after.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(after.get("secretKeyLast4"))), null);
+        return after;
+    }
+
+    /** Decrypted PLATFORM AlphaPay secret key, or empty when unset/unreadable. */
+    public Optional<String> platformAlphaPaySecretKey() {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var row = platformKeyRepo.findById("ALPHAPAY").orElse(null);
+            if (row == null || row.getEncryptedSecretKey() == null
+                    || row.getEncryptedSecretKey().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(row.getEncryptedSecretKey(), gatewayKeySecret));
         } catch (Exception e) {
             return Optional.empty();
         }

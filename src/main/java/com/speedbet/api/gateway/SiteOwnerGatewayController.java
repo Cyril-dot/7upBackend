@@ -79,4 +79,31 @@ public class SiteOwnerGatewayController {
                 gatewayService.setDirect(owner, saId, req.get("ghGateway"), req.get("ngGateway")),
                 "Branch gateways set. Any pending request for this branch was superseded."));
     }
+
+    /** Masked status of the platform (general) AlphaPay key. */
+    @GetMapping("/platform-keys")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> platformKeys() {
+        var out = new LinkedHashMap<String, Object>();
+        out.put("alphaPayKeys", gatewayService.platformAlphaPayKeyStatus());
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    /**
+     * Site-owner write of the PLATFORM (general) AlphaPay secret key.
+     * Body: {"secretKey": "sk_live_..."} to set, or {"clear": true} to
+     * remove it and go back to the env key. This is the key used when a
+     * branch has NOT set its own — it is the general key for the whole
+     * platform, set from the app with no server access needed.
+     */
+    @PutMapping("/platform-keys/alphapay")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setPlatformAlphaPayKey(
+            @AuthenticationPrincipal User owner,
+            @RequestBody Map<String, Object> req) {
+        boolean clear = Boolean.TRUE.equals(req.get("clear"));
+        String secretKey = req.get("secretKey") == null ? null : String.valueOf(req.get("secretKey"));
+        return ResponseEntity.ok(ApiResponse.ok(
+                gatewayService.setPlatformAlphaPayKey(owner, secretKey, clear),
+                clear ? "Platform AlphaPay key removed — deposits now use the env key."
+                        : "Platform AlphaPay key saved."));
+    }
 }
