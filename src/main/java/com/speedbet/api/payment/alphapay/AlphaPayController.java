@@ -323,6 +323,10 @@ public class AlphaPayController {
                 log.warn("AlphaPay key resolution fell back to platform key: {}", e.getMessage());
             }
         }
+        // v159: platform key set by the site owner in the app (no server
+        // access needed) sits between the branch key and the env key.
+        var platform = gatewayService.platformAlphaPaySecretKey();
+        if (platform.isPresent()) return platform.get();
         return secretKey;
     }
 
@@ -336,6 +340,8 @@ public class AlphaPayController {
         } catch (Exception e) {
             log.warn("AlphaPay webhook key resolution fell back to platform key: {}", e.getMessage());
         }
+        var platform = gatewayService.platformAlphaPaySecretKey();
+        if (platform.isPresent()) return platform.get();
         return secretKey;
     }
 
