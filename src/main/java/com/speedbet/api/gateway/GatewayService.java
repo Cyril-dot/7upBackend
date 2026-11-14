@@ -504,6 +504,43 @@ public class GatewayService {
         return after;
     }
 
+    // ─── Branch deposits maintenance mode (v161) ──────────────────────────
+    // A super admin can pause ALL deposits for their branch. The deposit
+    // page shows maintenance instead of the form, and the Ghana deposit
+    // inits refuse to start (400). Null on the row = enabled (the default),
+    // so existing branches change nothing until their super admin flips it.
+    public boolean depositsEnabledFor(User user) {
+        var saId = resolveBranchSuperAdmin(user);
+        if (saId.isEmpty()) return true;
+        var setting = settingRepo.findBySuperAdminId(saId.get()).orElse(null);
+        if (setting == null || setting.getDepositsEnabled() == null) return true;
+        return setting.getDepositsEnabled();
+    }
+
+    public void requireDepositsEnabled(User user) {
+        if (!depositsEnabledFor(user))
+            throw ApiException.badRequest("Deposits are under maintenance for your branch. Please try again later.");
+    }
+
+    @Transactional
+    public Map<String, Object> setDepositsEnabled(User sa, boolean enabled) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can pause deposits for their branch.");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId())
+                .orElseGet(() -> BranchGatewaySetting.builder()
+                        .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
+        boolean before = setting.getDepositsEnabled() == null || setting.getDepositsEnabled();
+        setting.setDepositsEnabled(enabled);
+        setting.setUpdatedBy(sa.getId());
+        setting.setUpdatedAt(Instant.now());
+        var saved = settingRepo.save(setting);
+        auditService.log(sa.getId(), "SET_DEPOSITS_ENABLED", "branch_gateway_settings", saved.getId(),
+                Map.of("depositsEnabled", before),
+                Map.of("depositsEnabled", enabled), null);
+        return Map.of("depositsEnabled", enabled);
+    }
+
     /** Decrypted branch RushPay API key, or empty when unset/unreadable. */
     public Optional<String> branchRushPayApiKey(UUID saId) {
         try {

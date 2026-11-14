@@ -101,6 +101,7 @@ public class AlphaPayController {
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
+        gatewayService.requireDepositsEnabled(user);
         log.info("[AlphaPay][init] START — userId='{}'", user.getId());
 
         var amount = extractValidAmount(req);

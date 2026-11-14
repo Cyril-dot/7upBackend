@@ -116,6 +116,13 @@ public class BranchGatewaySetting {
     @Column(name = "gh_rushpay_webhook_secret_last4", length = 10)
     private String ghRushpayWebhookSecretLast4;
 
+    // ── Branch deposits maintenance mode (v161) ──────────────────────────
+    // Null = deposits enabled (the default). A super admin flips this from
+    // their Gateways tab; when false, users on the branch see the deposit
+    // page in maintenance mode and the Ghana deposit inits refuse to start.
+    @Column(name = "deposits_enabled")
+    private Boolean depositsEnabled;
+
     // ── Branch platform settings: per-branch limits (optional) ────────
     // Null = platform default. The super admin sets these from their
     // Settings tab; the deposit page, betslip and withdrawal page all

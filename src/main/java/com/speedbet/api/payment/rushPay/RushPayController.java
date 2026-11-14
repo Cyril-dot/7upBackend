@@ -128,6 +128,7 @@ public class RushPayController {
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
+        gatewayService.requireDepositsEnabled(user);
         var amount = new BigDecimal(req.get("amount").toString());
         var effMin = branchGhMinDeposit(user);
         if (amount.compareTo(effMin) < 0)
