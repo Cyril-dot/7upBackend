@@ -8,7 +8,7 @@ import java.time.Instant;
 /**
  * The PLATFORM (general) gateway secret for one gateway, set by the site
  * owner in the app — no server access needed. One row per gateway name
- * (today only "ALPHAPAY"). This is the platform fallback key: it is used
+ * ("ALPHAPAY", "RUSHPAY"). This is the platform fallback key: it is used
  * when a branch has NOT set its own key, and it sits between the branch
  * key and the Railway env key in the resolution order
  * (branch key -> platform DB key -> env key).
@@ -33,6 +33,14 @@ public class PlatformGatewayKey {
 
     @Column(name = "secret_key_last4", length = 10)
     private String secretKeyLast4;
+
+    // RushPay's second half: the webhook secret that verifies settlement
+    // webhooks (HMAC). Only used by the RUSHPAY row; null for other rows.
+    @Column(name = "encrypted_webhook_secret", length = 500)
+    private String encryptedWebhookSecret;
+
+    @Column(name = "webhook_secret_last4", length = 10)
+    private String webhookSecretLast4;
 
     @Column(name = "updated_at")
     private Instant updatedAt;

@@ -30,6 +30,7 @@ public class BranchGatewayController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> myBranchGateway(
             @AuthenticationPrincipal User user) {
         var out = new LinkedHashMap<String, Object>(gatewayService.activeFor(user));
+        out.put("depositsEnabled", gatewayService.depositsEnabledFor(user));
         out.put("limits", gatewayService.branchLimitsFor(user));
         return ResponseEntity.ok(ApiResponse.ok(out));
     }
