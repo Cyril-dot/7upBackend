@@ -326,11 +326,32 @@ public class AlphaPayController {
     // ═══════════════════════════════════════════════════════════════════════════
     @GetMapping("/api/webhooks/alphapay")
     public ResponseEntity<Void> browserReturn(@RequestParam(value = "reference", required = false) String reference) {
-        var target = reference != null ? returnUrls.getOrDefault(reference, returnUrl) : returnUrl;
+        // Resolve the base ONCE: the per-payment URL the frontend sent at init
+        // (the same origin the customer started on), else the env return URL.
+        // v166 stored it but the old line below rebuilt the target from the
+        // env URL every time, so the stored URL never took effect.
+        var base = reference != null ? returnUrls.getOrDefault(reference, returnUrl) : returnUrl;
+        // Never leave the browser on the backend itself: if the resolved base
+        // points at a Railway host (misconfigured env), fall back to the
+        // Vercel app. After payment the customer must always land on the
+        // site, never on the Railway link.
+        if (isRailwayHost(base)) base = "https://7up-six.vercel.app/#/payment-result";
+        var target = base;
         if (reference != null && REF_PATTERN.matcher(reference).matches()) {
-            target = returnUrl + (returnUrl.contains("?") ? "&" : "?") + "reference=" + reference;
+            target = base + (base.contains("?") ? "&" : "?") + "reference=" + reference;
         }
         return ResponseEntity.status(302).location(URI.create(target)).build();
+    }
+
+    // A return target that points at the API host is a misconfiguration —
+    // the customer must always land on the site, never on the Railway link.
+    private static boolean isRailwayHost(String url) {
+        try {
+            var h = URI.create(url).getHost();
+            return h != null && (h.endsWith(".railway.app") || h.equals("railway.app"));
+        } catch (Exception e) {
+            return true; // unparseable target: fail safe to the Vercel app
+        }
     }
 
     // ─── AlphaPay key resolution ─────────────────────────────────────────────
