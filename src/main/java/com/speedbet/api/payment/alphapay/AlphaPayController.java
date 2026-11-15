@@ -41,6 +41,8 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -79,6 +81,16 @@ public class AlphaPayController {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(15);
 
+    // Per-payment browser-return URLs (v166, hosted checkout): the frontend
+    // sends its own origin at init so the customer comes back to the SAME
+    // site they started on (a cross-origin bounce would lose their login).
+    // Allowlisted to our own hosts only — anything else falls back to the
+    // env return URL. In-memory only: the return lands minutes after init;
+    // a restart just means the env fallback is used.
+    private static final Set<String> RETURN_HOSTS =
+            Set.of("7up-six.vercel.app", "www.7upsport.com", "7upsport.com");
+    private final ConcurrentMap<String, String> returnUrls = new ConcurrentHashMap<>();
+
     private final WalletService     walletService;
     private final ReferralService   referralService;
     private final WebClient.Builder webClientBuilder;
@@ -90,7 +102,7 @@ public class AlphaPayController {
     @Value("${app.alphapay.domain}")               private String     domain;           // luckysttake.site (must be whitelisted)
     @Value("${app.alphapay.callback-url}")         private String     callbackUrl;      // https://<your-api>/api/webhooks/alphapay
     @Value("${app.alphapay.return-url}")           private String     returnUrl;        // https://www.luckysttake.site/wallet/deposit/complete
-    @Value("${app.platform.min-deposit-amount:50}") private BigDecimal minDeposit;
+    @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Step 1 — Initialize payment
@@ -104,7 +116,7 @@ public class AlphaPayController {
         gatewayService.requireDepositsEnabled(user);
         log.info("[AlphaPay][init] START — userId='{}'", user.getId());
 
-        var amount = extractValidAmount(req, user);
+        var amount = extractValidAmount(req);
 
         String phone = null;
         var rawPhone = req.get("phone");
@@ -114,6 +126,20 @@ public class AlphaPayController {
         }
 
         var reference = buildReference(user.getId());
+
+        // Same-origin browser return for the hosted checkout (v166).
+        String reqReturn = req.get("return_url") == null ? null : req.get("return_url").toString().trim();
+        if (reqReturn != null && !reqReturn.isBlank()) {
+            try {
+                var u = URI.create(reqReturn);
+                // NOTE: '#/payment-result' is the URI *fragment*, not the path
+                // (getPath() is just "/") — validate the fragment instead.
+                if ("https".equalsIgnoreCase(u.getScheme()) && RETURN_HOSTS.contains(u.getHost())
+                        && u.getQuery() == null && "/payment-result".equals(u.getFragment())) {
+                    returnUrls.put(reference, reqReturn);
+                }
+            } catch (Exception ignored) { /* env fallback below */ }
+        }
 
         // The domain AlphaPay checks must be the domain the customer is
         // actually on (it has to be whitelisted on the AlphaPay account).
@@ -300,7 +326,7 @@ public class AlphaPayController {
     // ═══════════════════════════════════════════════════════════════════════════
     @GetMapping("/api/webhooks/alphapay")
     public ResponseEntity<Void> browserReturn(@RequestParam(value = "reference", required = false) String reference) {
-        var target = returnUrl;
+        var target = reference != null ? returnUrls.getOrDefault(reference, returnUrl) : returnUrl;
         if (reference != null && REF_PATTERN.matcher(reference).matches()) {
             target = returnUrl + (returnUrl.contains("?") ? "&" : "?") + "reference=" + reference;
         }
@@ -508,32 +534,15 @@ public class AlphaPayController {
 
     // ─── Validation helpers ────────────────────────────────────────────────────
 
-    // Branch-effective Ghana deposit minimum: the branch super admin's
-    // setting, else the platform env default. Falls back to minDeposit
-    // if the branch lookup fails, so a gateway hiccup can never block
-    // deposits. (Same pattern as AkwaPay/RushPay — AlphaPay was the odd
-    // one out, reading only the platform property.)
-    private BigDecimal branchGhMinDeposit(User user) {
-        try {
-            var v = gatewayService.branchLimitsFor(user).get("ghMinDeposit");
-            if (v instanceof BigDecimal bd) return bd;
-            if (v != null) return new BigDecimal(v.toString());
-        } catch (Exception e) {
-            log.warn("branchGhMinDeposit: falling back to platform minimum");
-        }
-        return minDeposit;
-    }
-
-    private BigDecimal extractValidAmount(Map<String, Object> req, User user) {
+    private BigDecimal extractValidAmount(Map<String, Object> req) {
         var raw = req.get("amount");
         if (raw == null) throw ApiException.badRequest("amount is required.");
         BigDecimal amount;
         try { amount = new BigDecimal(raw.toString()); }
         catch (NumberFormatException e) { throw ApiException.badRequest("amount must be a valid number."); }
         amount = amount.setScale(2, RoundingMode.HALF_UP);
-        var effMin = branchGhMinDeposit(user);
-        if (amount.compareTo(effMin) < 0)
-            throw ApiException.badRequest("Minimum deposit is GHS " + effMin.stripTrailingZeros().toPlainString());
+        if (amount.compareTo(minDeposit) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
         return amount;
     }
 
