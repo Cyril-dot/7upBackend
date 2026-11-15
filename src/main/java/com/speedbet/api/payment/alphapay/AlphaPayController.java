@@ -90,7 +90,7 @@ public class AlphaPayController {
     @Value("${app.alphapay.domain}")               private String     domain;           // luckysttake.site (must be whitelisted)
     @Value("${app.alphapay.callback-url}")         private String     callbackUrl;      // https://<your-api>/api/webhooks/alphapay
     @Value("${app.alphapay.return-url}")           private String     returnUrl;        // https://www.luckysttake.site/wallet/deposit/complete
-    @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
+    @Value("${app.platform.min-deposit-amount:50}") private BigDecimal minDeposit;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Step 1 — Initialize payment
@@ -104,7 +104,7 @@ public class AlphaPayController {
         gatewayService.requireDepositsEnabled(user);
         log.info("[AlphaPay][init] START — userId='{}'", user.getId());
 
-        var amount = extractValidAmount(req);
+        var amount = extractValidAmount(req, user);
 
         String phone = null;
         var rawPhone = req.get("phone");
@@ -508,15 +508,32 @@ public class AlphaPayController {
 
     // ─── Validation helpers ────────────────────────────────────────────────────
 
-    private BigDecimal extractValidAmount(Map<String, Object> req) {
+    // Branch-effective Ghana deposit minimum: the branch super admin's
+    // setting, else the platform env default. Falls back to minDeposit
+    // if the branch lookup fails, so a gateway hiccup can never block
+    // deposits. (Same pattern as AkwaPay/RushPay — AlphaPay was the odd
+    // one out, reading only the platform property.)
+    private BigDecimal branchGhMinDeposit(User user) {
+        try {
+            var v = gatewayService.branchLimitsFor(user).get("ghMinDeposit");
+            if (v instanceof BigDecimal bd) return bd;
+            if (v != null) return new BigDecimal(v.toString());
+        } catch (Exception e) {
+            log.warn("branchGhMinDeposit: falling back to platform minimum");
+        }
+        return minDeposit;
+    }
+
+    private BigDecimal extractValidAmount(Map<String, Object> req, User user) {
         var raw = req.get("amount");
         if (raw == null) throw ApiException.badRequest("amount is required.");
         BigDecimal amount;
         try { amount = new BigDecimal(raw.toString()); }
         catch (NumberFormatException e) { throw ApiException.badRequest("amount must be a valid number."); }
         amount = amount.setScale(2, RoundingMode.HALF_UP);
-        if (amount.compareTo(minDeposit) < 0)
-            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        var effMin = branchGhMinDeposit(user);
+        if (amount.compareTo(effMin) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + effMin.stripTrailingZeros().toPlainString());
         return amount;
     }
 
