@@ -172,6 +172,12 @@ public class SecurityConfig {
                         //       this path is permitAll: RushPay's servers have no JWT.
                         .requestMatchers(HttpMethod.GET,  "/api/tip/**").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/webhooks/**").permitAll()
+                        // GET /api/webhooks/alphapay is the BROWSER return after an
+                        // AlphaPay hosted checkout: the customer has no JWT, and the
+                        // handler only 302-redirects them back to the site (it changes
+                        // no state). Without this the return 403s and the customer is
+                        // left staring at the Railway link instead of the Vercel app.
+                        .requestMatchers(HttpMethod.GET,  "/api/webhooks/alphapay").permitAll()
 
                         // ── Booking ───────────────────────────────────────────────────────
                         .requestMatchers(HttpMethod.POST, "/api/booking/redeem").permitAll()
