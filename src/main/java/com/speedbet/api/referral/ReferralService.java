@@ -16,6 +16,7 @@ import java.math.MathContext;
 import java.math.RoundingMode;
 import java.security.SecureRandom;
 import java.time.Instant;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -75,6 +76,19 @@ public class ReferralService {
     }
 
     /**
+     * The admin's newest usable link: active and not expired. Used when an
+     * upgrade reuses a link instead of minting a new one, and when a
+     * superseded code is healed at registration.
+     */
+    public Optional<ReferralLink> newestActiveLink(UUID adminId) {
+        return linkRepo.findByAdminId(adminId).stream()
+                .filter(ReferralLink::isActive)
+                .filter(l -> l.getExpiresAt() == null || l.getExpiresAt().isAfter(Instant.now()))
+                .max(Comparator.comparing(ReferralLink::getCreatedAt,
+                        Comparator.nullsFirst(Comparator.naturalOrder())));
+    }
+
+    /**
      * Resolves a referral code supplied at registration into an attribution
      * decision. Registration is NEVER blocked by a bad code: an unrecognised,
      * expired or deactivated code — or a code belonging to the registering
@@ -94,8 +108,22 @@ public class ReferralService {
         if (code == null || code.isBlank()) return new ReferralResolution(null, true);
         ReferralLink link = findValidLinkByCode(code).orElse(null);
         if (link == null) {
-            log.info("resolveRegistrationReferral: code={} did not resolve to a valid link", code);
-            return new ReferralResolution(null, false);
+            // Heal superseded codes: a code that exists but is inactive was
+            // almost certainly killed by a past admin upgrade, which used to
+            // deactivate every old link. The admin behind it is still real,
+            // so resolve to their current active link instead of rejecting
+            // the registration. Naturally-expired links are NOT healed:
+            // those are still active=true, so they never reach this branch.
+            link = linkRepo.findByCode(code)
+                    .filter(l -> !l.isActive())
+                    .flatMap(l -> newestActiveLink(l.getAdminId()))
+                    .orElse(null);
+            if (link == null) {
+                log.info("resolveRegistrationReferral: code={} did not resolve to a valid link", code);
+                return new ReferralResolution(null, false);
+            }
+            log.info("resolveRegistrationReferral: code={} superseded — healed to admin's active linkId={}",
+                    code, link.getId());
         }
         var owner = userRepo.findById(link.getAdminId()).orElse(null);
         if (owner != null && owner.getEmail() != null && owner.getEmail().equalsIgnoreCase(email)) {
@@ -314,6 +342,30 @@ public class ReferralService {
         log.info("createAdminUpgradeLink: adminId={} defaultRate={}%",
                 adminId, DEFAULT_ADMIN_COMMISSION);
 
+        // Reuse the admin's newest active link when one exists: the code
+        // people already shared (WhatsApp, flyers) keeps working, and
+        // bumping its rate in place means existing referrals earn the new
+        // rate with no migration. Nothing is deactivated — deactivating old
+        // links is what used to silently kill shared links. Only mint a
+        // fresh link when the admin has no active link at all.
+        Optional<ReferralLink> reused = newestActiveLink(adminId);
+        if (reused.isPresent()) {
+            ReferralLink link = reused.get();
+            link.setCommissionPercent(DEFAULT_ADMIN_COMMISSION);
+            linkRepo.save(link);
+            log.info("createAdminUpgradeLink: reused active link code={} id={} at {}%",
+                    link.getCode(), link.getId(), DEFAULT_ADMIN_COMMISSION);
+
+            List<Referral> existing = referralRepo.findByAdminId(adminId);
+            for (Referral r : existing) {
+                r.setLinkId(link.getId());
+                referralRepo.save(r);
+            }
+            log.info("createAdminUpgradeLink: migrated {} referral(s) to linkId={} at {}%",
+                    existing.size(), link.getId(), DEFAULT_ADMIN_COMMISSION);
+            return link;
+        }
+
         ReferralLink newLink = createLink(
                 adminId,
                 "Admin upgrade link",
@@ -330,7 +382,8 @@ public class ReferralService {
         log.info("createAdminUpgradeLink: migrated {} referral(s) to linkId={} at {}%",
                 existing.size(), newLink.getId(), DEFAULT_ADMIN_COMMISSION);
 
-        // Deactivate old links
+        // Deactivate old links (all inactive already — there was no active
+        // link to reuse — but keep the sweep for safety).
         List<ReferralLink> oldLinks = linkRepo.findByAdminIdAndIdNot(adminId, newLink.getId());
         for (ReferralLink old : oldLinks) {
             old.setActive(false);
