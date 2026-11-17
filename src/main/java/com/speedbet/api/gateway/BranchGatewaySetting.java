@@ -63,6 +63,27 @@ public class BranchGatewaySetting {
     @Column(name = "ng_manual_account_name", length = 100)
     private String ngManualAccountName;
 
+    // ── Ghana: this branch's OWN manual MoMo (MoMoPay) receiving details ──
+    // Set directly by the branch's super admin (see GatewayService
+    // .setGhManualMomo). These are the super admin's OWN MoMoPay merchant
+    // details, shown to Ghanaian users as the manual MoMo deposit option on
+    // the deposit page (HolyStar-style: pay via *170# MoMoPay, submit the
+    // 11-digit Transaction ID + receipt). They are NOT a platform gateway
+    // choice, so unlike ghGateway they need no site-owner approval, and
+    // setting them does NOT change ghGateway — manual MoMo is an ADDITIONAL
+    // deposit option alongside the gateway checkout. All three are null
+    // when the super admin has not set them, and the manual option is
+    // hidden from users until all three are present.
+    // Nullable columns only, so ddl-auto=update adds them safely.
+    @Column(name = "gh_manual_momo_merchant_id", length = 50)
+    private String ghManualMomoMerchantId;
+
+    @Column(name = "gh_manual_momo_merchant_name", length = 100)
+    private String ghManualMomoMerchantName;
+
+    @Column(name = "gh_manual_momo_account_name", length = 100)
+    private String ghManualMomoAccountName;
+
     // ── Ghana: this branch's OWN AkwaPay credentials (optional) ─────────
     // Encrypted with GatewaySecretCrypto (server env GATEWAY_KEY_SECRET).
     // When set, Ghana deposits from users on this branch run on the super
