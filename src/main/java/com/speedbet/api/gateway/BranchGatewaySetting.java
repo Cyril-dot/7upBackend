@@ -84,6 +84,14 @@ public class BranchGatewaySetting {
     @Column(name = "gh_manual_momo_account_name", length = 100)
     private String ghManualMomoAccountName;
 
+    // ── Ghana manual MoMo on/off switch ──
+    // The super admin can flip the manual MoMo option off without deleting
+    // their merchant details: when false, the deposit page hides the manual
+    // option but the SA panel still shows the saved details. Null = enabled
+    // (branches that set details before this switch existed stay live).
+    @Column(name = "gh_manual_momo_enabled")
+    private Boolean ghManualMomoEnabled;
+
     // ── Ghana: this branch's OWN AkwaPay credentials (optional) ─────────
     // Encrypted with GatewaySecretCrypto (server env GATEWAY_KEY_SECRET).
     // When set, Ghana deposits from users on this branch run on the super
