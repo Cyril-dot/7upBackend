@@ -174,6 +174,15 @@ public class GatewayService {
         return row;
     }
 
+    /**
+     * Whether the branch's manual MoMo option is switched on. Null counts as
+     * enabled, so branches that set their details before the switch existed
+     * stay live; only an explicit false hides the option from users.
+     */
+    public static boolean ghManualMomoEnabled(BranchGatewaySetting s) {
+        return s == null || s.getGhManualMomoEnabled() == null || s.getGhManualMomoEnabled();
+    }
+
     /** Active gateways for a user: their branch's setting, or the platform defaults. */
     public Map<String, Object> activeFor(User user) {
         var saId = resolveBranchSuperAdmin(user);
@@ -191,7 +200,7 @@ public class GatewayService {
         out.put("ghGateway", setting == null ? DEFAULT_GH : setting.getGhGateway());
         out.put("ngGateway", setting == null ? DEFAULT_NG : setting.getNgGateway());
         out.put("ngManualBank", ngManualBankRow(setting));
-        out.put("ghManualMomo", ghManualMomoRow(setting));
+        out.put("ghManualMomo", ghManualMomoEnabled(setting) ? ghManualMomoRow(setting) : null);
         out.put("isBranchDefault", setting == null);
         return out;
     }
@@ -203,6 +212,7 @@ public class GatewayService {
         row.put("ngGateway", s.getNgGateway());
         row.put("ngManualBank", ngManualBankRow(s));
         row.put("ghManualMomo", ghManualMomoRow(s));
+        row.put("ghManualMomoEnabled", ghManualMomoEnabled(s));
         row.put("updatedBy", s.getUpdatedBy() == null ? null : s.getUpdatedBy().toString());
         row.put("updatedAt", s.getUpdatedAt() == null ? null : s.getUpdatedAt().toString());
         return row;
@@ -287,6 +297,9 @@ public class GatewayService {
         setting.setGhManualMomoMerchantId(mid);
         setting.setGhManualMomoMerchantName(mname);
         setting.setGhManualMomoAccountName(aname);
+        if (setting.getGhManualMomoEnabled() == null) {
+            setting.setGhManualMomoEnabled(true);
+        }
         setting.setUpdatedBy(sa.getId());
         setting.setUpdatedAt(Instant.now());
         var saved = settingRepo.save(setting);
@@ -294,6 +307,36 @@ public class GatewayService {
                 before == null ? null : Map.of("ghManualMomo", before),
                 Map.of("ghManualMomo", ghManualMomoRow(saved)), null);
         return ghManualMomoRow(saved);
+    }
+
+    /**
+     * On/off switch for the branch's Ghana manual MoMo option. Flipping it
+     * off hides the manual option from Ghanaian users but keeps the saved
+     * merchant details (the SA panel still shows them, and flipping back on
+     * restores the option with no re-typing). Requires details to be set
+     * before it can be turned on. Direct SA write, audit-logged.
+     */
+    @Transactional
+    public Map<String, Object> setGhManualMomoEnabled(User sa, boolean enabled) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can change the manual MoMo option for their branch.");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId()).orElse(null);
+        if (setting == null || ghManualMomoRow(setting) == null) {
+            throw ApiException.badRequest("Set your MoMoPay merchant details first — there is nothing to switch on yet.");
+        }
+        var before = ghManualMomoEnabled(setting);
+        setting.setGhManualMomoEnabled(enabled);
+        setting.setUpdatedBy(sa.getId());
+        setting.setUpdatedAt(Instant.now());
+        var saved = settingRepo.save(setting);
+        auditService.log(sa.getId(), "SET_GH_MANUAL_MOMO_ENABLED", "branch_gateway_settings", saved.getId(),
+                Map.of("ghManualMomoEnabled", before),
+                Map.of("ghManualMomoEnabled", ghManualMomoEnabled(saved)), null);
+        var out = new LinkedHashMap<String, Object>();
+        out.put("ghManualMomo", ghManualMomoRow(saved));
+        out.put("ghManualMomoEnabled", ghManualMomoEnabled(saved));
+        return out;
     }
 
     // ─── Super admin's OWN Ghana (AkwaPay) credentials ─────────────────

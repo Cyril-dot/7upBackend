@@ -232,4 +232,21 @@ public class SuperAdminGatewayController {
         return ResponseEntity.ok(ApiResponse.ok(out,
                 "Ghana manual MoMo details saved. Ghanaian users on your branch now see them as the manual MoMo deposit option."));
     }
+
+    /**
+     * On/off switch for the branch's Ghana MANUAL MoMo option. Off hides
+     * the manual option from Ghanaian users; the saved merchant details
+     * stay in place, so flipping it back on needs no re-typing.
+     */
+    @PutMapping("/gh-manual-momo/toggle")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> toggleGhManualMomo(
+            @AuthenticationPrincipal User actor,
+            @RequestBody Map<String, Object> req) {
+        requireSuperAdmin(actor);
+        boolean enabled = Boolean.TRUE.equals(req.get("enabled"));
+        var saved = gatewayService.setGhManualMomoEnabled(actor, enabled);
+        return ResponseEntity.ok(ApiResponse.ok(saved,
+                enabled ? "Manual MoMo is ON for your branch — Ghanaian users see it as an extra deposit option."
+                        : "Manual MoMo is OFF for your branch — Ghanaian users no longer see it. Your merchant details are saved."));
+    }
 }
