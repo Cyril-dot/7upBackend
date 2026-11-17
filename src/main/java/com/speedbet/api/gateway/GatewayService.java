@@ -155,6 +155,25 @@ public class GatewayService {
         return row;
     }
 
+    /**
+     * Ghana manual MoMo (MoMoPay) details for a branch setting, or null when
+     * the super admin has not set all three. The deposit page hides the
+     * manual MoMo option on null — half-set details are never shown to users.
+     */
+    public static Map<String, Object> ghManualMomoRow(BranchGatewaySetting s) {
+        if (s == null
+                || s.getGhManualMomoMerchantId() == null || s.getGhManualMomoMerchantId().isBlank()
+                || s.getGhManualMomoMerchantName() == null || s.getGhManualMomoMerchantName().isBlank()
+                || s.getGhManualMomoAccountName() == null || s.getGhManualMomoAccountName().isBlank()) {
+            return null;
+        }
+        var row = new LinkedHashMap<String, Object>();
+        row.put("merchantId", s.getGhManualMomoMerchantId());
+        row.put("merchantName", s.getGhManualMomoMerchantName());
+        row.put("accountName", s.getGhManualMomoAccountName());
+        return row;
+    }
+
     /** Active gateways for a user: their branch's setting, or the platform defaults. */
     public Map<String, Object> activeFor(User user) {
         var saId = resolveBranchSuperAdmin(user);
@@ -164,6 +183,7 @@ public class GatewayService {
             out.put("ghGateway", DEFAULT_GH);
             out.put("ngGateway", DEFAULT_NG);
             out.put("ngManualBank", null);
+            out.put("ghManualMomo", null);
             out.put("isBranchDefault", true);
             return out;
         }
@@ -171,6 +191,7 @@ public class GatewayService {
         out.put("ghGateway", setting == null ? DEFAULT_GH : setting.getGhGateway());
         out.put("ngGateway", setting == null ? DEFAULT_NG : setting.getNgGateway());
         out.put("ngManualBank", ngManualBankRow(setting));
+        out.put("ghManualMomo", ghManualMomoRow(setting));
         out.put("isBranchDefault", setting == null);
         return out;
     }
@@ -181,6 +202,7 @@ public class GatewayService {
         row.put("ghGateway", s.getGhGateway());
         row.put("ngGateway", s.getNgGateway());
         row.put("ngManualBank", ngManualBankRow(s));
+        row.put("ghManualMomo", ghManualMomoRow(s));
         row.put("updatedBy", s.getUpdatedBy() == null ? null : s.getUpdatedBy().toString());
         row.put("updatedAt", s.getUpdatedAt() == null ? null : s.getUpdatedAt().toString());
         return row;
@@ -230,6 +252,48 @@ public class GatewayService {
         return ngManualBankRow(saved);
 
 
+    }
+
+    // ─── Super admin sets their own Ghana manual MoMo details ──────────
+
+    /**
+     * Direct super-admin write — deliberately NOT the gateway-request flow.
+     * These MoMoPay details are the super admin's OWN receiving merchant
+     * for manual Ghanaian deposits, so the super admin sets them directly
+     * and they go live immediately. Unlike setNgManualBank, this does NOT
+     * flip ghGateway: manual MoMo is an ADDITIONAL deposit option next to
+     * the gateway checkout, not a replacement for it. Plain ADMINs and the
+     * site owner are refused here (the owner uses the owner endpoints,
+     * never a branch's details).
+     */
+    @Transactional
+    public Map<String, Object> setGhManualMomo(User sa, String merchantId, String merchantName, String accountName) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can set manual MoMo details for their branch.");
+        }
+        var mid = merchantId == null ? "" : merchantId.trim();
+        var mname = merchantName == null ? "" : merchantName.trim();
+        var aname = accountName == null ? "" : accountName.trim();
+        if (mid.isEmpty() || mname.isEmpty() || aname.isEmpty()) {
+            throw ApiException.badRequest("Merchant ID, merchant name and account name are all required.");
+        }
+        if (mid.length() > 50 || mname.length() > 100 || aname.length() > 100) {
+            throw ApiException.badRequest("Manual MoMo details are too long (merchant ID max 50, merchant / account name max 100).");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId())
+                .orElseGet(() -> BranchGatewaySetting.builder()
+                        .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
+        var before = ghManualMomoRow(setting);
+        setting.setGhManualMomoMerchantId(mid);
+        setting.setGhManualMomoMerchantName(mname);
+        setting.setGhManualMomoAccountName(aname);
+        setting.setUpdatedBy(sa.getId());
+        setting.setUpdatedAt(Instant.now());
+        var saved = settingRepo.save(setting);
+        auditService.log(sa.getId(), "SET_GH_MANUAL_MOMO", "branch_gateway_settings", saved.getId(),
+                before == null ? null : Map.of("ghManualMomo", before),
+                Map.of("ghManualMomo", ghManualMomoRow(saved)), null);
+        return ghManualMomoRow(saved);
     }
 
     // ─── Super admin's OWN Ghana (AkwaPay) credentials ─────────────────

@@ -210,4 +210,26 @@ public class SuperAdminGatewayController {
         return ResponseEntity.ok(ApiResponse.ok(out,
                 "Nigeria manual bank details saved. Nigerian users on your branch now see them as the manual bank transfer option."));
     }
+
+    /**
+     * Direct set of the branch's Ghana MANUAL MoMo (MoMoPay) details
+     * (merchant ID, merchant name, account name). Unlike the gateway
+     * request above, this is NOT owner-approved: the details are the super
+     * admin's own receiving merchant, and they go live on the Ghanaian
+     * deposit page immediately as an extra deposit option next to the
+     * gateway checkout. Plain ADMINs and the site owner are refused by
+     * requireSuperAdmin.
+     */
+    @PutMapping("/gh-manual-momo")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setGhManualMomo(
+            @AuthenticationPrincipal User actor,
+            @RequestBody Map<String, String> req) {
+        requireSuperAdmin(actor);
+        var saved = gatewayService.setGhManualMomo(actor,
+                req.get("merchantId"), req.get("merchantName"), req.get("accountName"));
+        var out = new LinkedHashMap<String, Object>();
+        out.put("ghManualMomo", saved);
+        return ResponseEntity.ok(ApiResponse.ok(out,
+                "Ghana manual MoMo details saved. Ghanaian users on your branch now see them as the manual MoMo deposit option."));
+    }
 }
