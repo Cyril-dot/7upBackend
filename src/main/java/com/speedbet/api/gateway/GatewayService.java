@@ -895,6 +895,21 @@ public class GatewayService {
     }
 
     /**
+     * Audit trail for a super-admin ZentraPay refund (v187, guide §9).
+     * Records the reference + amount only — no key material, no wallet change.
+     */
+    public void logZentraPayRefund(User sa, String reference, BigDecimal amount, String reason) {
+        if (sa == null) return;
+        var setting = settingRepo.findBySuperAdminId(sa.getId()).orElse(null);
+        auditService.log(sa.getId(), "REFUND_ZENTRAPAY", "branch_gateway_settings",
+                setting == null ? null : setting.getId(),
+                Map.of("reference", reference == null ? "" : reference,
+                        "amount", amount == null ? "" : amount.toPlainString(),
+                        "reason", reason == null ? "" : reason),
+                Map.of(), null);
+    }
+
+    /**
      * Decrypted platform ZentraPay keys for the eye toggle in the owner
      * panel. Site-owner only. Audit-logged (set/unset + last4 only).
      */
