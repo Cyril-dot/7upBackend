@@ -55,7 +55,7 @@ public class GatewayService {
     public static final BigDecimal DEFAULT_GH_WITHDRAWAL = new BigDecimal("2000");
     public static final BigDecimal DEFAULT_NG_WITHDRAWAL = new BigDecimal("200000");
 
-    public static final Set<String> ALLOWED_GH = Set.of("AKWAPAY", "GMP", "ALPHAPAY", "RUSHPAY");
+    public static final Set<String> ALLOWED_GH = Set.of("AKWAPAY", "GMP", "ALPHAPAY", "RUSHPAY", "ZENTRAPAY");
     public static final Set<String> ALLOWED_NG = Set.of("GMP", "KORAPAY", "MANUAL", "FLUTTERWAVE");
 
     private final BranchGatewaySettingRepository settingRepo;
@@ -849,6 +849,230 @@ public class GatewayService {
     }
 
     /** Branch super admin for a user id (webhook routing has no principal). */
+
+    // ─── ZentraPay keys (v185) — mirrors the RushPay block above ────────────
+    // Branch secret key + webhook secret, both-or-neither; platform keys
+    // the same, set by the site owner. Resolution order everywhere:
+    // branch -> platform DB -> env.
+
+    public Map<String, Object> zentraPayKeyStatus(UUID saId) {
+        var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+        boolean keySet = setting != null
+                && setting.getGhZentrapaySecretKey() != null
+                && !setting.getGhZentrapaySecretKey().isBlank();
+        boolean whSet = setting != null
+                && setting.getGhZentrapayWebhookSecret() != null
+                && !setting.getGhZentrapayWebhookSecret().isBlank();
+        var out = new LinkedHashMap<String, Object>();
+        out.put("secretKeySet", keySet);
+        out.put("secretKeyLast4", keySet ? setting.getGhZentrapaySecretKeyLast4() : null);
+        out.put("webhookSecretSet", whSet);
+        return out;
+    }
+
+    /**
+     * Direct super-admin write of their OWN ZentraPay credentials for Ghana
+     * deposits on their branch. Blank fields keep their current value;
+     * clear=true wipes both halves back to the platform keys. Values are
+     * encrypted before storage; audit logs carry only set/unset + last4,
+     * never a value. ZentraPay needs BOTH halves: the secret key (Bearer
+     * auth) creates charges, and the webhook secret verifies settlement
+     * webhooks (HMAC) — a key without its webhook secret creates payments
+     * that can never settle by webhook, so both-or-neither like RushPay.
+     */
+    @Transactional
+    public Map<String, Object> setZentraPayKeys(User sa, String secretKey, String webhookSecret, boolean clear) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can set ZentraPay credentials for their branch.");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId())
+                .orElseGet(() -> BranchGatewaySetting.builder()
+                        .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
+        var before = zentraPayKeyStatus(sa.getId());
+        if (clear) {
+            setting.setGhZentrapaySecretKey(null);
+            setting.setGhZentrapaySecretKeyLast4(null);
+            setting.setGhZentrapayWebhookSecret(null);
+            setting.setGhZentrapayWebhookSecretLast4(null);
+        } else {
+            String ks = requireKeySecret();
+            boolean touched = false;
+            if (secretKey != null && !secretKey.isBlank()) {
+                String v = secretKey.trim();
+                try {
+                    setting.setGhZentrapaySecretKey(GatewaySecretCrypto.encrypt(v, ks));
+                } catch (Exception e) {
+                    throw ApiException.badRequest("Could not store the secret key.");
+                }
+                setting.setGhZentrapaySecretKeyLast4(v.length() <= 4 ? v : v.substring(v.length() - 4));
+                touched = true;
+            }
+            if (webhookSecret != null && !webhookSecret.isBlank()) {
+                String v = webhookSecret.trim();
+                try {
+                    setting.setGhZentrapayWebhookSecret(GatewaySecretCrypto.encrypt(v, ks));
+                } catch (Exception e) {
+                    throw ApiException.badRequest("Could not store the webhook secret.");
+                }
+                setting.setGhZentrapayWebhookSecretLast4(v.length() <= 4 ? v : v.substring(v.length() - 4));
+                touched = true;
+            }
+            if (!touched) {
+                throw ApiException.badRequest("Enter a secret key, a webhook secret, or use Remove to go back to the platform keys.");
+            }
+        }
+        boolean finalKey = setting.getGhZentrapaySecretKey() != null && !setting.getGhZentrapaySecretKey().isBlank();
+        boolean finalWh = setting.getGhZentrapayWebhookSecret() != null && !setting.getGhZentrapayWebhookSecret().isBlank();
+        if (finalKey != finalWh) {
+            throw ApiException.badRequest("Save both the secret key and the webhook secret together — a key without its webhook secret creates payments that can never settle by webhook.");
+        }
+        setting.setUpdatedBy(sa.getId());
+        setting.setUpdatedAt(Instant.now());
+        var saved = settingRepo.save(setting);
+        var after = zentraPayKeyStatus(sa.getId());
+        auditService.log(sa.getId(), "SET_ZENTRAPAY_KEYS", "branch_gateway_settings", saved.getId(),
+                Map.of("secretKeySet", before.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(before.get("secretKeyLast4")),
+                        "webhookSecretSet", before.get("webhookSecretSet")),
+                Map.of("secretKeySet", after.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(after.get("secretKeyLast4")),
+                        "webhookSecretSet", after.get("webhookSecretSet")), null);
+        return after;
+    }
+
+    /** Decrypted branch ZentraPay secret key, or empty when unset/unreadable. */
+    public Optional<String> branchZentraPaySecretKey(UUID saId) {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+            if (setting == null || setting.getGhZentrapaySecretKey() == null
+                    || setting.getGhZentrapaySecretKey().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhZentrapaySecretKey(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Decrypted branch ZentraPay webhook secret, or empty when unset/unreadable. */
+    public Optional<String> branchZentraPayWebhookSecret(UUID saId) {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+            if (setting == null || setting.getGhZentrapayWebhookSecret() == null
+                    || setting.getGhZentrapayWebhookSecret().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhZentrapayWebhookSecret(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Masked PLATFORM ZentraPay key status only — the values are never returned. */
+    public Map<String, Object> platformZentraPayKeyStatus() {
+        var row = platformKeyRepo.findById("ZENTRAPAY").orElse(null);
+        boolean keySet = row != null
+                && row.getEncryptedSecretKey() != null
+                && !row.getEncryptedSecretKey().isBlank();
+        boolean whSet = row != null
+                && row.getEncryptedWebhookSecret() != null
+                && !row.getEncryptedWebhookSecret().isBlank();
+        var out = new LinkedHashMap<String, Object>();
+        out.put("secretKeySet", keySet);
+        out.put("secretKeyLast4", keySet ? row.getSecretKeyLast4() : null);
+        out.put("webhookSecretSet", whSet);
+        out.put("webhookSecretLast4", whSet ? row.getWebhookSecretLast4() : null);
+        return out;
+    }
+
+    /**
+     * Site-owner write of the PLATFORM (general) ZentraPay secret key +
+     * webhook secret. Used when a branch has NOT set its own keys.
+     * clear=true deletes the row and goes back to the env keys. Encrypted
+     * before storage; audit logs carry only set/unset + last4, never the
+     * values. Both halves are saved together, like the branch keys.
+     */
+    @Transactional
+    public Map<String, Object> setPlatformZentraPayKey(User owner, String secretKey, String webhookSecret, boolean clear) {
+        if (owner == null || owner.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Only the site owner can set the platform ZentraPay keys.");
+        }
+        var before = platformZentraPayKeyStatus();
+        if (clear) {
+            platformKeyRepo.deleteById("ZENTRAPAY");
+        } else {
+            String ks = requireKeySecret();
+            var existing = platformKeyRepo.findById("ZENTRAPAY").orElse(null);
+            // Start from the saved row (a blank field keeps its current
+            // value); then the final row must have both halves or neither.
+            String encKey = existing == null ? null : existing.getEncryptedSecretKey();
+            String last4Key = existing == null ? null : existing.getSecretKeyLast4();
+            String encWh = existing == null ? null : existing.getEncryptedWebhookSecret();
+            String last4Wh = existing == null ? null : existing.getWebhookSecretLast4();
+            try {
+                if (secretKey != null && !secretKey.isBlank()) {
+                    String v = secretKey.trim();
+                    encKey = GatewaySecretCrypto.encrypt(v, ks);
+                    last4Key = v.length() <= 4 ? v : v.substring(v.length() - 4);
+                }
+                if (webhookSecret != null && !webhookSecret.isBlank()) {
+                    String v = webhookSecret.trim();
+                    encWh = GatewaySecretCrypto.encrypt(v, ks);
+                    last4Wh = v.length() <= 4 ? v : v.substring(v.length() - 4);
+                }
+            } catch (Exception e) {
+                throw ApiException.badRequest("Could not store the ZentraPay keys.");
+            }
+            if ((encKey == null || encKey.isBlank()) != (encWh == null || encWh.isBlank())) {
+                throw ApiException.badRequest("Save both the secret key and the webhook secret together — a key without its webhook secret creates payments that can never settle by webhook.");
+            }
+            if (encKey == null || encKey.isBlank()) {
+                throw ApiException.badRequest("Enter the ZentraPay secret key and webhook secret, or use Remove to go back to the env keys.");
+            }
+            platformKeyRepo.save(PlatformGatewayKey.builder()
+                    .gateway("ZENTRAPAY")
+                    .encryptedSecretKey(encKey)
+                    .secretKeyLast4(last4Key)
+                    .encryptedWebhookSecret(encWh)
+                    .webhookSecretLast4(last4Wh)
+                    .updatedAt(Instant.now())
+                    .build());
+        }
+        var after = platformZentraPayKeyStatus();
+        auditService.log(owner.getId(), "SET_PLATFORM_ZENTRAPAY_KEYS", "platform_gateway_keys", null,
+                Map.of("secretKeySet", before.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(before.get("secretKeyLast4")),
+                        "webhookSecretSet", before.get("webhookSecretSet")),
+                Map.of("secretKeySet", after.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(after.get("secretKeyLast4")),
+                        "webhookSecretSet", after.get("webhookSecretSet")), null);
+        return after;
+    }
+
+    /** Decrypted PLATFORM ZentraPay secret key, or empty when unset/unreadable. */
+    public Optional<String> platformZentraPaySecretKey() {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var row = platformKeyRepo.findById("ZENTRAPAY").orElse(null);
+            if (row == null || row.getEncryptedSecretKey() == null
+                    || row.getEncryptedSecretKey().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(row.getEncryptedSecretKey(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Decrypted PLATFORM ZentraPay webhook secret, or empty when unset/unreadable. */
+    public Optional<String> platformZentraPayWebhookSecret() {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var row = platformKeyRepo.findById("ZENTRAPAY").orElse(null);
+            if (row == null || row.getEncryptedWebhookSecret() == null
+                    || row.getEncryptedWebhookSecret().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(row.getEncryptedWebhookSecret(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
     public Optional<UUID> resolveBranchSuperAdminId(UUID userId) {
         if (userId == null) return Optional.empty();
         var user = userRepo.findById(userId).orElse(null);

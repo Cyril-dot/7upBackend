@@ -1,0 +1,639 @@
+package com.speedbet.api.payment.zentrapay;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.speedbet.api.common.ApiException;
+import com.speedbet.api.common.ApiResponse;
+import com.speedbet.api.gateway.GatewayService;
+import com.speedbet.api.referral.ReferralService;
+import com.speedbet.api.user.User;
+import com.speedbet.api.wallet.TxKind;
+import com.speedbet.api.wallet.WalletService;
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
+import reactor.util.retry.Retry;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Duration;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeoutException;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * ZentraPay (https://api.zentrapay.online) mobile-money deposit integration.
+ *
+ * Flow (direct MoMo prompt — no hosted checkout, no browser widget):
+ *  1. POST /api/wallet/deposit/zentrapay/init {amount, phone, network?}
+ *     -> ZentraPay POST /v1/charges/charge sends the USSD/STK prompt
+ *        straight to the customer's handset. Returns {reference, status:
+ *        "PENDING"}. The reference is OURS (DEP_<userId>_<random>) so the
+ *        userId is recoverable from every later call and webhook.
+ *  2. Customer approves on the phone with their MoMo PIN; ZentraPay POSTs
+ *     charge.success to /api/webhooks/zentrapay.
+ *  3. GET  /api/wallet/deposit/zentrapay/status?ref=... -> frontend poll;
+ *     server-to-server GET /v1/charges/verify/:reference, credits on
+ *     SUCCESS (idempotent — duplicate references 409 and are swallowed).
+ *
+ * Why server-to-server (unlike RushPay): ZentraPay's /charge is a plain
+ * Bearer-auth server API — no browser-scoped widget session — so the
+ * secret key never leaves this backend. Do not move the charge call to
+ * the browser.
+ *
+ * Security model (mirrors AlphaPay):
+ *  - Webhook identity = HMAC-SHA256 over the raw body, keyed with the
+ *    webhook secret (header x-zentrapay-signature). The secret is
+ *    resolved per payment from the reference: branch key, else platform
+ *    key, else env.
+ *  - Even after the signature passes, we NEVER trust the payload: we call
+ *    ZentraPay's verify API and credit only the amount/status it returns
+ *    server-to-server.
+ *  - The reference embeds the userId, and the status endpoint asserts it
+ *    belongs to the authenticated user, so one user can't trigger or
+ *    inspect another user's deposit.
+ *
+ * Money rule: the wallet is credited the FULL requested amount; 7UP
+ * absorbs the ZentraPay fee (same as PayTeller). The verify response
+ * carries fee/net_amount for the ledger, but credit uses amount.
+ */
+@Slf4j
+@RestController
+@RequiredArgsConstructor
+public class ZentraPayController {
+
+    // DEP_<32 hex userId without dashes>_<12 hex random> (same as AlphaPay)
+    private static final Pattern REF_PATTERN = Pattern.compile("^DEP_([0-9a-f]{32})_[0-9a-f]{12}$");
+
+    private static final Set<String> MTN_GH_PREFIXES = Set.of("024", "025", "053", "054", "055", "059");
+    private static final Set<String> ATL_GH_PREFIXES = Set.of("026", "027", "056", "057");
+    private static final Set<String> VOD_GH_PREFIXES = Set.of("020", "050");
+
+    private static final Duration TIMEOUT = Duration.ofSeconds(15);
+
+    private final WalletService    walletService;
+    private final ReferralService  referralService;
+    private final WebClient.Builder webClientBuilder;
+    private final ObjectMapper     objectMapper;
+    private final GatewayService   gatewayService;
+
+    @Value("${app.zentrapay.secret-key:}")          private String     secretKey;
+    @Value("${app.zentrapay.webhook-secret:}")      private String     webhookSecret;
+    @Value("${app.zentrapay.base-url:https://api.zentrapay.online}") private String baseUrl;
+    @Value("${app.zentrapay.callback-url:https://7upbackend-production.up.railway.app/api/webhooks/zentrapay}") private String callbackUrl;
+    @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Step 1 — Direct MoMo charge (prompt goes to the phone)
+    // Body: { "amount": 50, "phone": "0241234567", "network": "MTN" (optional) }
+    // ═══════════════════════════════════════════════════════════════════════════
+    @PostMapping("/api/wallet/deposit/zentrapay/init")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> init(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        gatewayService.requireDepositsEnabled(user);
+        log.info("[ZentraPay][init] START — userId='{}'", user.getId());
+
+        var amount = extractValidAmount(req);
+
+        String phone = null;
+        var rawPhone = req.get("phone");
+        if (rawPhone != null && !rawPhone.toString().isBlank()) {
+            phone = normalizeGhanaPhone(rawPhone.toString().trim());
+            warnIfUnknownPrefix(phone);
+        }
+        if (phone == null) {
+            throw ApiException.badRequest("Enter your MoMo number.");
+        }
+
+        // Network: explicit body value wins; else derive from the prefix;
+        // unknown prefix -> omit and let ZentraPay auto-detect.
+        String network = null;
+        var rawNet = req.get("network");
+        if (rawNet != null && !rawNet.toString().isBlank()) {
+            network = normalizeNetwork(rawNet.toString().trim());
+        }
+        if (network == null) {
+            network = networkForPrefix(phone.substring(0, 3));
+        }
+
+        var reference = buildReference(user.getId());
+
+        var body = new LinkedHashMap<String, Object>();
+        body.put("amount",       amount);              // BigDecimal, GHS, 2dp — NOT pesewas
+        body.put("email",        user.getEmail());
+        body.put("phone",        phone);               // plain 10-digit local form
+        if (network != null) body.put("network", network);
+        body.put("reference",    reference);
+        body.put("callback_url", callbackUrl);
+
+        log.info("[ZentraPay][init] Calling charge — userId='{}' ref='{}' amountGHS={} phone='{}' network='{}'",
+                user.getId(), reference, amount, maskPhone(phone), network);
+
+        // Idempotency-Key is deterministic per reference: a retried init
+        // replays safely instead of billing twice.
+        var response = callZentraPay(HttpMethod.POST, "/v1/charges/charge", body, true, "init",
+                secretKeyFor(user), "zentrapay_" + reference);
+
+        var data = response.get("data");
+        var status = data instanceof Map<?, ?> dm ? String.valueOf(dm.get("status")) : null;
+        log.info("[ZentraPay][init] DONE — userId='{}' ref='{}' status='{}'", user.getId(), reference, status);
+
+        var out = new LinkedHashMap<String, Object>();
+        out.put("reference", reference);
+        out.put("status", status == null ? "PENDING" : status);
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Status — frontend polling + fallback (webhooks retry, but the poll is
+    // the primary credit path when the user stays on the deposit page).
+    // Credits the wallet if ZentraPay says SUCCESS. Safe to call repeatedly:
+    // walletService.credit() throws 409 on duplicate reference, which we swallow.
+    // ═══════════════════════════════════════════════════════════════════════════
+    @GetMapping("/api/wallet/deposit/zentrapay/status")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> status(
+            @AuthenticationPrincipal User user,
+            @RequestParam("ref") String ref) {
+
+        if (ref == null || ref.isBlank()) {
+            throw ApiException.badRequest("ref is required.");
+        }
+        assertReferenceBelongsTo(user, ref);
+        log.info("[ZentraPay][status] userId='{}' ref='{}'", user.getId(), ref);
+
+        var verified = zentraPayVerify(ref, secretKeyFor(user));
+        var result = verifyResult(verified, ref);
+        var status = String.valueOf(result.get("status"));
+
+        boolean credited = false;
+        if ("success".equals(status)) {
+            credited = creditFromVerified(user.getId(), ref, verified);
+        }
+
+        log.info("[ZentraPay][status] DONE — ref='{}' status='{}' credited={}", ref, status, credited);
+        var out = new LinkedHashMap<String, Object>();
+        out.put("credited", credited);
+        out.put("status", status);
+        out.put("message", "success".equals(status)
+                ? (credited ? "Payment verified. Your wallet has been credited."
+                            : "Payment was already processed.")
+                : "failed".equals(status)
+                        ? "Payment failed or was cancelled. No money left your account."
+                        : "Payment is still pending.");
+        if (verified.get("data") instanceof Map<?, ?> vdm
+                && ((Map<String, Object>) vdm).get("amount") != null)
+            out.put("amount", ((Map<String, Object>) vdm).get("amount"));
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // WEBHOOK — POST /api/webhooks/zentrapay   (covered by POST /api/webhooks/** permitAll)
+    // Header: x-zentrapay-signature = hex(HMAC_SHA256(rawBody, webhookSecret))
+    // Payload: { "event": "charge.success", "data": { "reference": "DEP_...", ... } }
+    // The reference is only used for routing here — nothing is credited until
+    // the signature passes AND the server-to-server verify below says SUCCESS.
+    // ═══════════════════════════════════════════════════════════════════════════
+    @PostMapping("/api/webhooks/zentrapay")
+    public ResponseEntity<String> webhook(
+            @RequestHeader(value = "x-zentrapay-signature", required = false) String signature,
+            HttpServletRequest request) {
+
+        log.info("[ZentraPay][Webhook] HIT — remote='{}'", request.getRemoteAddr());
+
+        // 1. Raw body (before any parsing)
+        byte[] rawBody;
+        try {
+            rawBody = request.getInputStream().readAllBytes();
+        } catch (Exception e) {
+            log.error("[ZentraPay][Webhook] Failed to read body", e);
+            return ResponseEntity.status(400).body("Failed to read body");
+        }
+
+        // 2. Signature present?
+        if (signature == null || signature.isBlank()) {
+            log.warn("[ZentraPay][Webhook] REJECTED — missing x-zentrapay-signature");
+            return ResponseEntity.status(400).body("Missing signature");
+        }
+
+        // 3. Resolve the signing secret for this payment: the reference tells
+        // us whose branch it belongs to, so a branch that set its own
+        // ZentraPay keys verifies with that webhook secret; everyone else
+        // uses the platform secret, then the env secret. When the reference
+        // cannot be read from the payload, fall back to the env secret.
+        UUID refUserId = null;
+        String refFromPayload = null;
+        try {
+            @SuppressWarnings("unchecked")
+            var peek = (Map<String, Object>) objectMapper
+                    .readValue(new String(rawBody, StandardCharsets.UTF_8), Map.class);
+            refFromPayload = extractReference(peek);
+            if (refFromPayload != null) {
+                refUserId = parseUserIdFromReference(refFromPayload);
+            }
+        } catch (Exception ignored) { }
+        var key = refUserId != null ? webhookSecretForUserId(refUserId) : webhookSecret;
+
+        if (!verifySignature(rawBody, signature.trim(), key)) {
+            log.warn("[ZentraPay][Webhook] REJECTED — HMAC mismatch (wrong webhook secret?)");
+            return ResponseEntity.status(400).body("Invalid signature");
+        }
+
+        // 4. Parse + dispatch
+        try {
+            @SuppressWarnings("unchecked")
+            var event = (Map<String, Object>) objectMapper
+                    .readValue(new String(rawBody, StandardCharsets.UTF_8), Map.class);
+
+            var eventType = String.valueOf(event.get("event"));
+            if (!"charge.success".equals(eventType)) {
+                log.info("[ZentraPay][Webhook] Ignored event='{}'", eventType);
+                return ResponseEntity.ok("Ignored");
+            }
+
+            var ref = refFromPayload != null ? refFromPayload : extractReference(event);
+            if (ref == null || ref.isBlank()) {
+                log.error("[ZentraPay][Webhook] charge.success without reference");
+                return ResponseEntity.status(400).body("Missing reference");
+            }
+
+            var userId = parseUserIdFromReference(ref);
+            if (userId == null) {
+                // Not one of ours (or malformed). 200 so it isn't treated as a delivery failure.
+                log.error("[ZentraPay][Webhook] UNRESOLVABLE userId from ref='{}'", ref);
+                return ResponseEntity.ok("OK-NO-USER");
+            }
+
+            // Never credit from the webhook body — confirm with ZentraPay server-to-server.
+            var verified = zentraPayVerify(ref, secretKeyForUserId(userId));
+            var result = verifyResult(verified, ref);
+            var status = String.valueOf(result.get("status"));
+            if (!"success".equals(status)) {
+                log.warn("[ZentraPay][Webhook] Verify says status='{}' for ref='{}' — NOT crediting", status, ref);
+                return ResponseEntity.ok("OK-NOT-SUCCESS");
+            }
+
+            creditFromVerified(userId, ref, verified);
+
+        } catch (ApiException e) {
+            log.error("[ZentraPay][Webhook] ApiException — {}", e.getMessage(), e);
+            return ResponseEntity.status(400).body("Bad request: " + e.getMessage());
+        } catch (Exception e) {
+            log.error("[ZentraPay][Webhook] Unexpected error: {}", e.getMessage(), e);
+            return ResponseEntity.status(500).body("Processing error");
+        }
+
+        log.info("[ZentraPay][Webhook] COMPLETE — 200 OK");
+        return ResponseEntity.ok("OK");
+    }
+
+    // ─── ZentraPay key resolution ─────────────────────────────────────────────
+    // A super admin can set their OWN ZentraPay secret key + webhook secret
+    // for their branch (GatewayService.setZentraPayKeys). When set, deposits
+    // from users on that branch run on the super admin's ZentraPay account;
+    // otherwise the platform keys (owner-set, else env) are used. Mirrors
+    // the RushPay branch-key pattern.
+    private String secretKeyFor(User user) {
+        if (user != null) {
+            try {
+                var saId = gatewayService.resolveBranchSuperAdmin(user);
+                if (saId.isPresent()) {
+                    var branch = gatewayService.branchZentraPaySecretKey(saId.get());
+                    if (branch.isPresent()) return branch.get();
+                }
+            } catch (Exception e) {
+                log.warn("ZentraPay key resolution fell back to platform key: {}", e.getMessage());
+            }
+        }
+        var platform = gatewayService.platformZentraPaySecretKey();
+        if (platform.isPresent()) return platform.get();
+        return secretKey;
+    }
+
+    private String secretKeyForUserId(UUID userId) {
+        try {
+            var saId = gatewayService.resolveBranchSuperAdminId(userId);
+            if (saId.isPresent()) {
+                var branch = gatewayService.branchZentraPaySecretKey(saId.get());
+                if (branch.isPresent()) return branch.get();
+            }
+        } catch (Exception e) {
+            log.warn("ZentraPay webhook key resolution fell back to platform key: {}", e.getMessage());
+        }
+        var platform = gatewayService.platformZentraPaySecretKey();
+        if (platform.isPresent()) return platform.get();
+        return secretKey;
+    }
+
+    private String webhookSecretForUserId(UUID userId) {
+        try {
+            var saId = gatewayService.resolveBranchSuperAdminId(userId);
+            if (saId.isPresent()) {
+                var branch = gatewayService.branchZentraPayWebhookSecret(saId.get());
+                if (branch.isPresent()) return branch.get();
+            }
+        } catch (Exception e) {
+            log.warn("ZentraPay webhook secret resolution fell back to platform secret: {}", e.getMessage());
+        }
+        var platform = gatewayService.platformZentraPayWebhookSecret();
+        if (platform.isPresent()) return platform.get();
+        return webhookSecret;
+    }
+
+    // ─── Wallet crediting ──────────────────────────────────────────────────────
+
+    /**
+     * Normalises a ZentraPay verify response to our own status shape.
+     * Verify data: { reference, status: "SUCCESS"|"PENDING"|"FAILED",
+     * amount, fee, net_amount, created_at }. Anything unrecognised stays
+     * pending — never defaults to success.
+     */
+    private Map<String, Object> verifyResult(Map<String, Object> response, String ref) {
+        @SuppressWarnings("unchecked")
+        var data = response.get("data") instanceof Map<?, ?> dm ? (Map<String, Object>) dm : null;
+        var raw = data != null && data.get("status") != null ? String.valueOf(data.get("status")) : null;
+        String status;
+        if ("SUCCESS".equalsIgnoreCase(raw)) {
+            status = "success";
+        } else if ("FAILED".equalsIgnoreCase(raw)) {
+            status = "failed";
+        } else {
+            status = "pending";
+        }
+        var out = new LinkedHashMap<String, Object>();
+        out.put("reference", ref);
+        out.put("status", status);
+        return out;
+    }
+
+    private boolean creditFromVerified(UUID userId, String ref, Map<String, Object> verified) {
+        @SuppressWarnings("unchecked")
+        var data = verified.get("data") instanceof Map<?, ?> dm ? (Map<String, Object>) dm : null;
+        if (data == null || data.get("amount") == null) {
+            log.error("[ZentraPay][credit] Verify response missing data/amount ref='{}'", ref);
+            throw ApiException.badRequest("Invalid verify response from ZentraPay.");
+        }
+        BigDecimal amount;
+        try {
+            amount = new BigDecimal(String.valueOf(data.get("amount"))).setScale(2, RoundingMode.HALF_UP);
+        } catch (Exception e) {
+            log.error("[ZentraPay][credit] Unparseable amount='{}' ref='{}'", data.get("amount"), ref);
+            throw ApiException.badRequest("Invalid amount from ZentraPay.");
+        }
+        if (amount.signum() <= 0) {
+            log.error("[ZentraPay][credit] Non-positive amount={} ref='{}'", amount, ref);
+            return false;
+        }
+
+        // Full requested amount is credited; 7UP absorbs the ZentraPay fee
+        // (fee/net_amount in the verify response are ledger info only).
+        return handleDeposit(userId, ref, amount);
+    }
+
+    private boolean handleDeposit(UUID userId, String ref, BigDecimal amount) {
+        log.info("[ZentraPay][handleDeposit] START — userId='{}' amountGHS={} ref='{}'", userId, amount, ref);
+
+        try {
+            walletService.credit(userId, amount, TxKind.DEPOSIT, ref,
+                    Map.of("provider", "zentrapay", "channel", "mobile_money", "reference", ref));
+            log.info("[ZentraPay][handleDeposit] CREDITED GHS {} — userId='{}' ref='{}'", amount, userId, ref);
+
+        } catch (ApiException ex) {
+            if (ex.getStatus().value() == 409) {
+                log.info("[ZentraPay][handleDeposit] Duplicate ref='{}' — already credited, skipping", ref);
+                return false;
+            }
+            log.error("[ZentraPay][handleDeposit] credit FAILED — userId='{}' ref='{}' — {}",
+                    userId, ref, ex.getMessage(), ex);
+            throw ex;
+        }
+
+        try {
+            referralService.attributeCommission(userId, amount);
+        } catch (Exception ex) {
+            // Commission failure must NEVER roll back the deposit
+            log.error("[ZentraPay][handleDeposit] Commission FAILED (non-blocking) — userId='{}' — {}",
+                    userId, ex.getMessage(), ex);
+        }
+        return true;
+    }
+
+    // ─── ZentraPay API calls ────────────────────────────────────────────────────
+
+    private Map<String, Object> zentraPayVerify(String reference, String key) {
+        if (!REF_PATTERN.matcher(reference).matches())
+            throw ApiException.badRequest("Invalid reference.");
+        return callZentraPay(HttpMethod.GET, "/v1/charges/verify/" + reference, null, true, "verify", key, null);
+    }
+
+    private static class UpstreamException extends RuntimeException {
+        final int status;
+        final String body;
+        UpstreamException(int status, String body) {
+            super("ZentraPay returned " + status + ": " + body);
+            this.status = status;
+            this.body = body;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> callZentraPay(HttpMethod method, String path, Object body,
+                                              boolean auth, String tag, String key, String idempotencyKey) {
+        if (auth && (key == null || key.isBlank())) {
+            throw ApiException.badRequest("ZentraPay is not set up for this branch yet — save your ZentraPay secret key in the Gateways tab, or ask the platform owner to set the platform key.");
+        }
+        var spec = webClientBuilder.build()
+                .method(method)
+                .uri(baseUrl + path)
+                .accept(MediaType.APPLICATION_JSON);
+
+        if (auth) spec = spec.header(HttpHeaders.AUTHORIZATION, "Bearer " + key);
+        if (idempotencyKey != null && !idempotencyKey.isBlank())
+            spec = spec.header("Idempotency-Key", idempotencyKey);
+        var withBody = body != null
+                ? spec.contentType(MediaType.APPLICATION_JSON).bodyValue(body)
+                : spec;
+
+        var mono = withBody.retrieve()
+                .onStatus(s -> s.isError(), r -> r.bodyToMono(String.class).defaultIfEmpty("")
+                        .map(b -> {
+                            log.error("[ZentraPay][{}] HTTP error — path='{}' status={} body='{}'",
+                                    tag, path, r.statusCode().value(), b);
+                            return (Throwable) new UpstreamException(r.statusCode().value(), b);
+                        }))
+                .bodyToMono(Map.class)
+                .timeout(TIMEOUT);
+
+        // Retry only idempotent GETs, and only on network/timeout/5xx. Never retry POSTs.
+        if (method == HttpMethod.GET) {
+            mono = mono.retryWhen(Retry.backoff(2, Duration.ofMillis(300))
+                    .filter(ex -> ex instanceof TimeoutException
+                            || ex instanceof WebClientRequestException
+                            || (ex instanceof UpstreamException u && u.status >= 500))
+                    .onRetryExhaustedThrow((s, sig) -> sig.failure()));
+        }
+
+        Map<String, Object> result;
+        try {
+            result = (Map<String, Object>) mono.block();
+        } catch (UpstreamException e) {
+            if (e.status >= 400 && e.status < 500) throw ApiException.badRequest(extractErrorMessage(e.body));
+            throw new RuntimeException("ZentraPay is currently unavailable. Please try again.", e);
+        } catch (Exception e) {
+            log.error("[ZentraPay][{}] call failed — {}", tag, e.getMessage(), e);
+            throw new RuntimeException("ZentraPay is currently unavailable. Please try again.", e);
+        }
+
+        if (result == null) throw new RuntimeException("ZentraPay returned empty response.");
+        return result;
+    }
+
+    /** ZentraPay errors look like { "status": false, "message": "..." }. */
+    @SuppressWarnings("unchecked")
+    private String extractErrorMessage(String rawBody) {
+        try {
+            var parsed = (Map<String, Object>) objectMapper.readValue(rawBody, Map.class);
+            if (parsed.get("message") != null) return parsed.get("message").toString();
+            if (parsed.get("detail") != null) return parsed.get("detail").toString();
+        } catch (Exception ignored) { }
+        if (rawBody != null && !rawBody.isBlank() && rawBody.length() < 200) return rawBody.trim();
+        return "Payment request was rejected.";
+    }
+
+    // ─── Reference helpers ─────────────────────────────────────────────────────
+
+    private String buildReference(UUID userId) {
+        var rand = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        return "DEP_" + userId.toString().replace("-", "") + "_" + rand;
+    }
+
+    private UUID parseUserIdFromReference(String ref) {
+        Matcher m = REF_PATTERN.matcher(ref);
+        if (!m.matches()) return null;
+        var h = m.group(1);
+        try {
+            return UUID.fromString(h.substring(0, 8) + "-" + h.substring(8, 12) + "-" + h.substring(12, 16)
+                    + "-" + h.substring(16, 20) + "-" + h.substring(20));
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    private void assertReferenceBelongsTo(User user, String reference) {
+        var owner = parseUserIdFromReference(reference);
+        if (owner == null || !owner.equals(user.getId()))
+            throw ApiException.badRequest("Unknown reference.");
+    }
+
+    /**
+     * Finds our DEP_ reference in a ZentraPay webhook payload. The docs
+     * show the event name but no sample body, so look in the usual places:
+     * data.reference, top-level reference, data.charge_reference.
+     */
+    @SuppressWarnings("unchecked")
+    private String extractReference(Map<String, Object> payload) {
+        if (payload == null) return null;
+        if (payload.get("data") instanceof Map<?, ?> dm) {
+            var data = (Map<String, Object>) dm;
+            if (data.get("reference") != null && !data.get("reference").toString().isBlank())
+                return data.get("reference").toString().trim();
+            if (data.get("charge_reference") != null && !data.get("charge_reference").toString().isBlank())
+                return data.get("charge_reference").toString().trim();
+        }
+        if (payload.get("reference") != null && !payload.get("reference").toString().isBlank())
+            return payload.get("reference").toString().trim();
+        return null;
+    }
+
+    // ─── Validation helpers ────────────────────────────────────────────────────
+
+    private BigDecimal extractValidAmount(Map<String, Object> req) {
+        var raw = req.get("amount");
+        if (raw == null) throw ApiException.badRequest("amount is required.");
+        BigDecimal amount;
+        try { amount = new BigDecimal(raw.toString()); }
+        catch (NumberFormatException e) { throw ApiException.badRequest("amount must be a valid number."); }
+        amount = amount.setScale(2, RoundingMode.HALF_UP);
+        if (amount.compareTo(minDeposit) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        return amount;
+    }
+
+    private String normalizeGhanaPhone(String raw) {
+        var digits = raw.replaceAll("[\\s\\-]", "");
+        if (digits.startsWith("+233"))                              digits = "0" + digits.substring(4);
+        else if (digits.startsWith("233") && digits.length() == 12) digits = "0" + digits.substring(3);
+        if (!digits.matches("^0\\d{9}$"))
+            throw ApiException.badRequest("Invalid Ghana phone. Use 0XXXXXXXXX or +233XXXXXXXXX.");
+        return digits;
+    }
+
+    private void warnIfUnknownPrefix(String phone) {
+        var p = phone.substring(0, 3);
+        if (!MTN_GH_PREFIXES.contains(p) && !ATL_GH_PREFIXES.contains(p) && !VOD_GH_PREFIXES.contains(p))
+            log.warn("[ZentraPay] phone prefix='{}' not in known Ghana MoMo ranges", p);
+    }
+
+    /** Maps a Ghana prefix to ZentraPay's network enum; null = let ZentraPay auto-detect. */
+    private String networkForPrefix(String prefix) {
+        if (MTN_GH_PREFIXES.contains(prefix)) return "MTN";
+        if (VOD_GH_PREFIXES.contains(prefix)) return "TELECEL";
+        if (ATL_GH_PREFIXES.contains(prefix)) return "AT";
+        return null;
+    }
+
+    /** Accepts MTN/TELECEL/AT (and common aliases); null when unrecognised. */
+    private String normalizeNetwork(String raw) {
+        var v = raw.trim().toUpperCase();
+        if (v.equals("MTN")) return "MTN";
+        if (v.equals("TELECEL") || v.equals("VODAFONE") || v.equals("VOD")) return "TELECEL";
+        if (v.equals("AT") || v.equals("AIRTELTIGO") || v.equals("AIRTEL") || v.equals("TIGO")) return "AT";
+        return null;
+    }
+
+    // ─── Signature ─────────────────────────────────────────────────────────────
+
+    private boolean verifySignature(byte[] rawBody, String signature, String key) {
+        if (key == null || key.isBlank()) return false;
+        try {
+            var mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            var computed = HexFormat.of().formatHex(mac.doFinal(rawBody));
+            // constant-time compare
+            return MessageDigest.isEqual(
+                    computed.getBytes(StandardCharsets.UTF_8),
+                    signature.toLowerCase().getBytes(StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            log.error("[ZentraPay][verifySignature] HMAC error", e);
+            return false;
+        }
+    }
+
+    private String maskPhone(String phone) {
+        if (phone == null || phone.length() < 7) return "***";
+        return phone.substring(0, 3) + "****" + phone.substring(phone.length() - 3);
+    }
+}

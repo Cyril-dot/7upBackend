@@ -34,7 +34,7 @@ public class BranchGatewaySetting {
     @Column(name = "super_admin_id", nullable = false, unique = true)
     private UUID superAdminId;
 
-    /** Ghana deposit gateway. Allowed: AKWAPAY, GMP, ALPHAPAY, RUSHPAY. */
+    /** Ghana deposit gateway. Allowed: AKWAPAY, GMP, ALPHAPAY, RUSHPAY, ZENTRAPAY. */
     @Column(name = "gh_gateway", nullable = false, length = 30)
     @Builder.Default
     private String ghGateway = "AKWAPAY";
@@ -144,6 +144,28 @@ public class BranchGatewaySetting {
 
     @Column(name = "gh_rushpay_webhook_secret_last4", length = 10)
     private String ghRushpayWebhookSecretLast4;
+
+    // ── Ghana: this branch's OWN ZentraPay credentials (optional) ─────────
+    // Encrypted with GatewaySecretCrypto (server env GATEWAY_KEY_SECRET).
+    // When set, Ghana deposits from users on this branch run on the super
+    // admin's own ZentraPay merchant account instead of the platform keys.
+    // ZentraPay needs BOTH halves: the secret key (Bearer auth for charges
+    // and verification) and the webhook secret (HMAC-SHA256 signature on
+    // settlement webhooks) — a key without its webhook secret would create
+    // prompts that can never settle by webhook. Blank = fall back to the
+    // platform keys. Only the last 4 of the secret key are ever returned,
+    // never the values.
+    @Column(name = "gh_zentrapay_secret_key", length = 500)
+    private String ghZentrapaySecretKey;
+
+    @Column(name = "gh_zentrapay_secret_key_last4", length = 10)
+    private String ghZentrapaySecretKeyLast4;
+
+    @Column(name = "gh_zentrapay_webhook_secret", length = 500)
+    private String ghZentrapayWebhookSecret;
+
+    @Column(name = "gh_zentrapay_webhook_secret_last4", length = 10)
+    private String ghZentrapayWebhookSecretLast4;
 
     // ── Branch deposits maintenance mode (v161) ──────────────────────────
     // Null = deposits enabled (the default). A super admin flips this from
