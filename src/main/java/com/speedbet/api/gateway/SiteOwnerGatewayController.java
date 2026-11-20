@@ -149,4 +149,14 @@ public class SiteOwnerGatewayController {
                         : "Platform ZentraPay keys saved."));
     }
 
+    /**
+     * Decrypted platform ZentraPay keys for the eye toggle in the owner
+     * panel. Site-owner only, audit-logged in the service.
+     */
+    @GetMapping("/platform-keys/zentrapay/reveal")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> revealPlatformZentraPayKeys(
+            @AuthenticationPrincipal User owner) {
+        return ResponseEntity.ok(ApiResponse.ok(gatewayService.revealPlatformZentraPayKeys(owner)));
+    }
+
 }

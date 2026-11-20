@@ -867,6 +867,50 @@ public class GatewayService {
         out.put("secretKeySet", keySet);
         out.put("secretKeyLast4", keySet ? setting.getGhZentrapaySecretKeyLast4() : null);
         out.put("webhookSecretSet", whSet);
+        out.put("webhookSecretLast4", whSet ? setting.getGhZentrapayWebhookSecretLast4() : null);
+        return out;
+    }
+
+    /**
+     * Decrypted branch ZentraPay keys for the eye toggle in the SA Gateways
+     * tab. Super-admin only, own branch. Audit-logged (set/unset + last4
+     * only — the values are returned to the caller and never logged).
+     */
+    public Map<String, Object> revealZentraPayKeys(User sa) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can view their branch ZentraPay keys.");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId()).orElse(null);
+        var status = zentraPayKeyStatus(sa.getId());
+        auditService.log(sa.getId(), "REVEAL_ZENTRAPAY_KEYS", "branch_gateway_settings",
+                setting == null ? null : setting.getId(),
+                Map.of("secretKeySet", status.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(status.get("secretKeyLast4")),
+                        "webhookSecretSet", status.get("webhookSecretSet")),
+                Map.of(), null);
+        var out = new LinkedHashMap<String, Object>();
+        out.put("secretKey", branchZentraPaySecretKey(sa.getId()).orElse(null));
+        out.put("webhookSecret", branchZentraPayWebhookSecret(sa.getId()).orElse(null));
+        return out;
+    }
+
+    /**
+     * Decrypted platform ZentraPay keys for the eye toggle in the owner
+     * panel. Site-owner only. Audit-logged (set/unset + last4 only).
+     */
+    public Map<String, Object> revealPlatformZentraPayKeys(User owner) {
+        if (owner == null || owner.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Only the site owner can view the platform ZentraPay keys.");
+        }
+        var status = platformZentraPayKeyStatus();
+        auditService.log(owner.getId(), "REVEAL_PLATFORM_ZENTRAPAY_KEYS", "platform_gateway_keys", null,
+                Map.of("secretKeySet", status.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(status.get("secretKeyLast4")),
+                        "webhookSecretSet", status.get("webhookSecretSet")),
+                Map.of(), null);
+        var out = new LinkedHashMap<String, Object>();
+        out.put("secretKey", platformZentraPaySecretKey().orElse(null));
+        out.put("webhookSecret", platformZentraPayWebhookSecret().orElse(null));
         return out;
     }
 

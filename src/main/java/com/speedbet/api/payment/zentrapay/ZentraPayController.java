@@ -6,6 +6,7 @@ import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.gateway.GatewayService;
 import com.speedbet.api.referral.ReferralService;
 import com.speedbet.api.user.User;
+import com.speedbet.api.user.UserRole;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
 import jakarta.servlet.http.HttpServletRequest;
@@ -13,9 +14,11 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -29,17 +32,24 @@ import reactor.util.retry.Retry;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import javax.net.ssl.SSLException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.net.ConnectException;
+import java.net.SocketTimeoutException;
+import java.net.URI;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -105,6 +115,53 @@ public class ZentraPayController {
     @Value("${app.zentrapay.callback-url:https://7upbackend-production.up.railway.app/api/webhooks/zentrapay}") private String callbackUrl;
     @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
+    // ─── Diagnostics (v186) ───────────────────────────────────────────────
+    // The last init failure on this instance, so the super admin can see
+    // WHY the last deposit died instead of the generic "internal error".
+    // No secrets, no full phone — masked like the logs. Lost on restart.
+    private static final AtomicReference<Map<String, Object>> LAST_INIT_FAILURE = new AtomicReference<>();
+
+    private static void recordInitFailure(String kind, String detail, String phoneMasked) {
+        var m = new LinkedHashMap<String, Object>();
+        m.put("at", Instant.now().toString());
+        m.put("kind", kind);
+        m.put("detail", detail);
+        if (phoneMasked != null) m.put("phone", phoneMasked);
+        LAST_INIT_FAILURE.set(m);
+    }
+
+    private static String last4(String v) {
+        if (v == null || v.isBlank()) return null;
+        return v.length() <= 4 ? v : v.substring(v.length() - 4);
+    }
+
+    private String apiHost() {
+        try { return URI.create(baseUrl).getHost(); } catch (Exception e) { return "the ZentraPay API"; }
+    }
+
+    /** Short plain-language reason for an upstream failure (no stack traces leave the server). */
+    private String upstreamReason(Throwable e) {
+        Throwable t = e;
+        while (t != null) {
+            if (t instanceof UnknownHostException)
+                return "Could not reach ZentraPay — could not resolve " + apiHost();
+            if (t instanceof ConnectException)
+                return "Could not reach ZentraPay — connection refused";
+            if (t instanceof SocketTimeoutException || t instanceof TimeoutException)
+                return "ZentraPay did not answer in time (15s timeout)";
+            if (t instanceof SSLException)
+                return "Could not reach ZentraPay — secure connection failed";
+            t = t.getCause();
+        }
+        if (e != null && (e.getClass().getSimpleName().contains("Decoding") || e.getClass().getSimpleName().contains("Json")))
+            return "ZentraPay returned an unexpected response";
+        return "ZentraPay is currently unavailable";
+    }
+
+    private ApiException upstreamUnavailable(Throwable e) {
+        return new ApiException(upstreamReason(e) + ". Please try again.", HttpStatus.BAD_GATEWAY);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Step 1 — Direct MoMo charge (prompt goes to the phone)
     // Body: { "amount": 50, "phone": "0241234567", "network": "MTN" (optional) }
@@ -155,8 +212,15 @@ public class ZentraPayController {
 
         // Idempotency-Key is deterministic per reference: a retried init
         // replays safely instead of billing twice.
-        var response = callZentraPay(HttpMethod.POST, "/v1/charges/charge", body, true, "init",
-                secretKeyFor(user), "zentrapay_" + reference);
+        Map<String, Object> response;
+        try {
+            response = callZentraPay(HttpMethod.POST, "/v1/charges/charge", body, true, "init",
+                    secretKeyFor(user), "zentrapay_" + reference);
+        } catch (ApiException e) {
+            if (e.getStatus().value() >= 500)
+                recordInitFailure("upstream", e.getMessage(), maskPhone(phone));
+            throw e;
+        }
 
         var data = response.get("data");
         var status = data instanceof Map<?, ?> dm ? String.valueOf(dm.get("status")) : null;
@@ -308,6 +372,114 @@ public class ZentraPayController {
 
         log.info("[ZentraPay][Webhook] COMPLETE — 200 OK");
         return ResponseEntity.ok("OK");
+    }
+
+    // ─── Diagnostics + key reveal (v186) ────────────────────────────────────
+    // Diagnostics: what key is actually in effect (source + last4 only,
+    // NEVER the value), whether this server can reach the ZentraPay API
+    // right now, whether the key is accepted (verify on a throwaway
+    // reference — 401 = bad key, 404 = key good, no money moves), and the
+    // last init failure on this instance. Super-admin only, own branch.
+    @GetMapping("/api/super-admin/gateway/zentrapay/diagnostics")
+    @PreAuthorize("hasRole('SUPER_ADMIN')")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> diagnostics(
+            @AuthenticationPrincipal User actor) {
+        if (actor == null || actor.getRole() != UserRole.SUPER_ADMIN)
+            throw ApiException.forbidden("Only a super admin can run ZentraPay diagnostics for their branch.");
+        var out = new LinkedHashMap<String, Object>();
+        var branchStatus = gatewayService.zentraPayKeyStatus(actor.getId());
+        var platformStatus = gatewayService.platformZentraPayKeyStatus();
+        String keySource; String keyLast4 = null;
+        if (gatewayService.branchZentraPaySecretKey(actor.getId()).isPresent()) {
+            keySource = "branch"; keyLast4 = (String) branchStatus.get("secretKeyLast4");
+        } else if (gatewayService.platformZentraPaySecretKey().isPresent()) {
+            keySource = "platform"; keyLast4 = (String) platformStatus.get("secretKeyLast4");
+        } else if (secretKey != null && !secretKey.isBlank()) {
+            keySource = "env"; keyLast4 = last4(secretKey);
+        } else { keySource = "none"; }
+        String whSource; String whLast4 = null;
+        if (gatewayService.branchZentraPayWebhookSecret(actor.getId()).isPresent()) {
+            whSource = "branch"; whLast4 = (String) branchStatus.get("webhookSecretLast4");
+        } else if (gatewayService.platformZentraPayWebhookSecret().isPresent()) {
+            whSource = "platform"; whLast4 = (String) platformStatus.get("webhookSecretLast4");
+        } else if (webhookSecret != null && !webhookSecret.isBlank()) {
+            whSource = "env"; whLast4 = last4(webhookSecret);
+        } else { whSource = "none"; }
+        out.put("keySource", keySource);
+        out.put("keyLast4", keyLast4);
+        out.put("webhookSecretSource", whSource);
+        out.put("webhookSecretLast4", whLast4);
+        out.put("health", probeHealth());
+        out.put("verify", probeVerify(actor));
+        out.put("lastInitFailure", LAST_INIT_FAILURE.get());
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    // Saved branch keys, decrypted, for the eye toggle in the SA Gateways
+    // tab. Super-admin only, own branch, audit-logged. The values are
+    // returned ONLY here — never in the key-status or diagnostics calls.
+    @GetMapping("/api/super-admin/gateway/zentrapay-keys/reveal")
+    @PreAuthorize("hasRole('SUPER_ADMIN')")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> revealKeys(
+            @AuthenticationPrincipal User actor) {
+        if (actor == null || actor.getRole() != UserRole.SUPER_ADMIN)
+            throw ApiException.forbidden("Only a super admin can view their branch ZentraPay keys.");
+        return ResponseEntity.ok(ApiResponse.ok(gatewayService.revealZentraPayKeys(actor)));
+    }
+
+    private Map<String, Object> probeHealth() {
+        var out = new LinkedHashMap<String, Object>();
+        long start = System.currentTimeMillis();
+        try {
+            var res = webClientBuilder.build().get().uri(baseUrl + "/health")
+                    .accept(MediaType.APPLICATION_JSON).retrieve()
+                    .toBodilessEntity().timeout(Duration.ofSeconds(5)).block();
+            out.put("reachable", true);
+            out.put("status", res != null ? res.getStatusCode().value() : null);
+            out.put("ms", System.currentTimeMillis() - start);
+            out.put("error", null);
+        } catch (Exception e) {
+            log.warn("[ZentraPay][diagnostics] health probe failed — {}", e.getMessage());
+            out.put("reachable", false);
+            out.put("status", null);
+            out.put("ms", System.currentTimeMillis() - start);
+            out.put("error", upstreamReason(e));
+        }
+        return out;
+    }
+
+    private Map<String, Object> probeVerify(User actor) {
+        var out = new LinkedHashMap<String, Object>();
+        var key = secretKeyFor(actor);
+        if (key == null || key.isBlank()) {
+            out.put("status", null);
+            out.put("verdict", "no key configured");
+            out.put("message", null);
+            return out;
+        }
+        String ref = "ZP_DIAG_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        try {
+            var res = webClientBuilder.build().get().uri(baseUrl + "/v1/charges/verify/" + ref)
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + key)
+                    .accept(MediaType.APPLICATION_JSON)
+                    .exchange().timeout(Duration.ofSeconds(10)).block();
+            int status = res != null ? res.statusCode().value() : 0;
+            String body = "";
+            if (res != null) {
+                try { body = res.bodyToMono(String.class).defaultIfEmpty("").block(); } catch (Exception ignored) { }
+            }
+            out.put("status", status);
+            if (status == 401) { out.put("verdict", "key rejected"); out.put("message", extractErrorMessage(body)); }
+            else if (status == 404) { out.put("verdict", "key accepted"); out.put("message", "Reference not found is expected — the key itself works."); }
+            else if (status == 200) { out.put("verdict", "key accepted"); out.put("message", extractErrorMessage(body)); }
+            else { out.put("verdict", "upstream HTTP " + status); out.put("message", extractErrorMessage(body)); }
+        } catch (Exception e) {
+            log.warn("[ZentraPay][diagnostics] verify probe failed — {}", e.getMessage());
+            out.put("status", null);
+            out.put("verdict", "unreachable");
+            out.put("message", upstreamReason(e));
+        }
+        return out;
     }
 
     // ─── ZentraPay key resolution ─────────────────────────────────────────────
@@ -501,13 +673,15 @@ public class ZentraPayController {
             result = (Map<String, Object>) mono.block();
         } catch (UpstreamException e) {
             if (e.status >= 400 && e.status < 500) throw ApiException.badRequest(extractErrorMessage(e.body));
-            throw new RuntimeException("ZentraPay is currently unavailable. Please try again.", e);
+            var detail = extractErrorMessage(e.body);
+            throw new ApiException("ZentraPay is currently unavailable (upstream HTTP " + e.status
+                    + (detail == null || detail.isBlank() ? "" : ": " + detail) + "). Please try again.", HttpStatus.BAD_GATEWAY);
         } catch (Exception e) {
             log.error("[ZentraPay][{}] call failed — {}", tag, e.getMessage(), e);
-            throw new RuntimeException("ZentraPay is currently unavailable. Please try again.", e);
+            throw upstreamUnavailable(e);
         }
 
-        if (result == null) throw new RuntimeException("ZentraPay returned empty response.");
+        if (result == null) throw new ApiException("ZentraPay returned an empty response. Please try again.", HttpStatus.BAD_GATEWAY);
         return result;
     }
 
