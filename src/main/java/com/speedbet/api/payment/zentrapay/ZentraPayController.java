@@ -54,7 +54,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * ZentraPay (https://api.zentrapay.online) mobile-money deposit integration.
+ * ZentraPay (https://zentrapay-lyart.vercel.app) mobile-money deposit integration.
  *
  * Flow (direct MoMo prompt — no hosted checkout, no browser widget):
  *  1. POST /api/wallet/deposit/zentrapay/init {amount, phone, network?}
@@ -111,7 +111,7 @@ public class ZentraPayController {
 
     @Value("${app.zentrapay.secret-key:}")          private String     secretKey;
     @Value("${app.zentrapay.webhook-secret:}")      private String     webhookSecret;
-    @Value("${app.zentrapay.base-url:https://api.zentrapay.online}") private String baseUrl;
+    @Value("${app.zentrapay.base-url:https://zentrapay-lyart.vercel.app}") private String baseUrl;
     @Value("${app.zentrapay.callback-url:https://7upbackend-production.up.railway.app/api/webhooks/zentrapay}") private String callbackUrl;
     @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
@@ -409,6 +409,7 @@ public class ZentraPayController {
         out.put("keyLast4", keyLast4);
         out.put("webhookSecretSource", whSource);
         out.put("webhookSecretLast4", whLast4);
+        out.put("baseUrl", baseUrl);
         out.put("health", probeHealth());
         out.put("verify", probeVerify(actor));
         out.put("lastInitFailure", LAST_INIT_FAILURE.get());
@@ -427,25 +428,90 @@ public class ZentraPayController {
         return ResponseEntity.ok(ApiResponse.ok(gatewayService.revealZentraPayKeys(actor)));
     }
 
+    // ─── Refunds (v187, guide §9) ──────────────────────────────────────────
+    // Super-admin only, own branch key, audit-logged. Refunds a SUCCESS
+    // ZentraPay charge back to the customer's MoMo (partial refunds allowed).
+    // ZentraPay enforces amount ≤ original (400 if too large) and the
+    // reference must exist (404 otherwise). This does NOT touch the player's
+    // wallet — if the credited amount was already spent, the SA adjusts the
+    // wallet by hand (owner Adjust balance) after refunding here.
+    @PostMapping("/api/super-admin/gateway/zentrapay/refund")
+    @PreAuthorize("hasRole('SUPER_ADMIN')")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> refund(
+            @AuthenticationPrincipal User actor,
+            @RequestBody Map<String, Object> req) {
+        if (actor == null || actor.getRole() != UserRole.SUPER_ADMIN)
+            throw ApiException.forbidden("Only a super admin can refund a ZentraPay payment.");
+        var reference = req == null || req.get("reference") == null ? "" : String.valueOf(req.get("reference")).trim();
+        if (reference.isBlank())
+            throw ApiException.badRequest("Enter the ZentraPay reference to refund (from the ZentraPay dashboard).");
+        BigDecimal amount;
+        try {
+            amount = req.get("amount") == null ? null : new BigDecimal(String.valueOf(req.get("amount")).trim());
+        } catch (Exception e) {
+            throw ApiException.badRequest("Enter a valid refund amount.");
+        }
+        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0)
+            throw ApiException.badRequest("Refund amount must be more than 0.");
+        var reason = req.get("reason") == null || String.valueOf(req.get("reason")).isBlank()
+                ? "Refund requested by super admin" : String.valueOf(req.get("reason")).trim();
+        var key = secretKeyFor(actor);
+        var body = new LinkedHashMap<String, Object>();
+        body.put("reference", reference);
+        body.put("amount", amount);
+        body.put("reason", reason);
+        // One stable idempotency key per (reference, amount) attempt — a
+        // second refund of the same reference for a different amount must
+        // not replay the first one.
+        String idem = "refund_" + reference + "_" + amount.stripTrailingZeros().toPlainString();
+        var result = callZentraPay(HttpMethod.POST, "/v1/refunds", body, true, "refund", key, idem);
+        gatewayService.logZentraPayRefund(actor, reference, amount, reason);
+        var out = new LinkedHashMap<String, Object>();
+        out.put("reference", reference);
+        out.put("amount", amount);
+        out.put("reason", reason);
+        out.put("zentrapay", result);
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
     private Map<String, Object> probeHealth() {
         var out = new LinkedHashMap<String, Object>();
         long start = System.currentTimeMillis();
         try {
             var res = webClientBuilder.build().get().uri(baseUrl + "/health")
-                    .accept(MediaType.APPLICATION_JSON).retrieve()
-                    .toBodilessEntity().timeout(Duration.ofSeconds(5)).block();
+                    .accept(MediaType.APPLICATION_JSON)
+                    .exchange().timeout(Duration.ofSeconds(5)).block();
+            int status = res != null ? res.statusCode().value() : 0;
+            String body = "";
+            if (res != null) {
+                try { body = res.bodyToMono(String.class).defaultIfEmpty("").block(); } catch (Exception ignored) { }
+            }
             out.put("reachable", true);
-            out.put("status", res != null ? res.getStatusCode().value() : null);
+            out.put("status", status);
             out.put("ms", System.currentTimeMillis() - start);
             out.put("error", null);
+            out.put("mode", extractMode(body));
         } catch (Exception e) {
             log.warn("[ZentraPay][diagnostics] health probe failed — {}", e.getMessage());
             out.put("reachable", false);
             out.put("status", null);
             out.put("ms", System.currentTimeMillis() - start);
             out.put("error", upstreamReason(e));
+            out.put("mode", null);
         }
         return out;
+    }
+
+    // The health endpoint reports a "mode" field ("mock" on the working host
+    // as of 20 Nov 2026). Surfaced in diagnostics so the super admin can see
+    // it — a mock-mode gateway must be confirmed real-money before live use.
+    @SuppressWarnings("unchecked")
+    private String extractMode(String body) {
+        try {
+            var parsed = (Map<String, Object>) objectMapper.readValue(body, Map.class);
+            Object mode = parsed.get("mode");
+            return mode == null ? null : String.valueOf(mode);
+        } catch (Exception ignored) { return null; }
     }
 
     private Map<String, Object> probeVerify(User actor) {
