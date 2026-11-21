@@ -57,7 +57,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * ZentraPay (https://zentrapay-lyart.vercel.app) mobile-money deposit integration.
+ * ZentraPay (https://api.zentrapay.online) mobile-money deposit integration.
  *
  * Flow (direct MoMo prompt — no hosted checkout, no browser widget):
  *  1. POST /api/wallet/deposit/zentrapay/init {amount, phone, network?}
@@ -114,7 +114,7 @@ public class ZentraPayController {
 
     @Value("${app.zentrapay.secret-key:}")          private String     secretKey;
     @Value("${app.zentrapay.webhook-secret:}")      private String     webhookSecret;
-    @Value("${app.zentrapay.base-url:https://zentrapay-lyart.vercel.app}") private String baseUrl;
+    @Value("${app.zentrapay.base-url:https://api.zentrapay.online}") private String baseUrl;
     @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
     // ─── Diagnostics (v186) ───────────────────────────────────────────────
@@ -231,17 +231,19 @@ public class ZentraPayController {
         log.info("[ZentraPay][init] Calling charge — userId='{}' ref='{}' amountGHS={} phone='{}' network='{}'",
                 user.getId(), reference, amount, maskPhone(phone), network);
 
-        // Idempotency-Key IS the reference (guide's terminal example uses the
-        // short reference as the key). The old "zentrapay_" + reference
-        // (59 chars) was rejected by the gateway with
-        // "Idempotency-Key must be 8-100 characters" and the charge came back
-        // FAILED with no prompt; the 49-char reference-as-key was proven live
-        // to return PENDING + a real MoMo prompt. A retried init still replays
-        // safely instead of billing twice (same reference -> same key).
+        // Idempotency-Key: a deterministic UUID per attempt, per the official
+        // ZentraPay REST API v1 guide (PDF section 03). The guide sends a UUID
+        // (e.g. 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d) as the key — NOT the
+        // merchant reference. Derived from our DEP_ reference so a retried
+        // init still replays safely instead of billing twice (same
+        // reference -> same UUID -> same key). The 49-char reference as the
+        // key returned PENDING but the prompt never reached a real handset;
+        // the UUID form is what the production API expects.
+        String idemKey = UUID.nameUUIDFromBytes(reference.getBytes(StandardCharsets.UTF_8)).toString();
         Map<String, Object> response;
         try {
             response = callZentraPay(HttpMethod.POST, "/v1/charges/charge", body, true, "init",
-                    secretKeyFor(user), reference);
+                    secretKeyFor(user), idemKey);
         } catch (ApiException e) {
             if (e.getStatus().value() >= 500)
                 recordInitFailure("upstream", e.getMessage(), maskPhone(phone));
