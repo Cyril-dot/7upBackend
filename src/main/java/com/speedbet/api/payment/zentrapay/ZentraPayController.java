@@ -113,7 +113,6 @@ public class ZentraPayController {
     @Value("${app.zentrapay.secret-key:}")          private String     secretKey;
     @Value("${app.zentrapay.webhook-secret:}")      private String     webhookSecret;
     @Value("${app.zentrapay.base-url:https://zentrapay-lyart.vercel.app}") private String baseUrl;
-    @Value("${app.zentrapay.callback-url:https://7upbackend-production.up.railway.app/api/webhooks/zentrapay}") private String callbackUrl;
     @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
     // ─── Diagnostics (v186) ───────────────────────────────────────────────
@@ -220,17 +219,21 @@ public class ZentraPayController {
         body.put("phone",        phone);               // plain 10-digit local form
         if (network != null) body.put("network", network);
         body.put("reference",    reference);
-        body.put("callback_url", callbackUrl);
 
         log.info("[ZentraPay][init] Calling charge — userId='{}' ref='{}' amountGHS={} phone='{}' network='{}'",
                 user.getId(), reference, amount, maskPhone(phone), network);
 
-        // Idempotency-Key is deterministic per reference: a retried init
-        // replays safely instead of billing twice.
+        // Idempotency-Key IS the reference (guide's terminal example uses the
+        // short reference as the key). The old "zentrapay_" + reference
+        // (59 chars) was rejected by the gateway with
+        // "Idempotency-Key must be 8-100 characters" and the charge came back
+        // FAILED with no prompt; the 49-char reference-as-key was proven live
+        // to return PENDING + a real MoMo prompt. A retried init still replays
+        // safely instead of billing twice (same reference -> same key).
         Map<String, Object> response;
         try {
             response = callZentraPay(HttpMethod.POST, "/v1/charges/charge", body, true, "init",
-                    secretKeyFor(user), "zentrapay_" + reference);
+                    secretKeyFor(user), reference);
         } catch (ApiException e) {
             if (e.getStatus().value() >= 500)
                 recordInitFailure("upstream", e.getMessage(), maskPhone(phone));
@@ -239,11 +242,20 @@ public class ZentraPayController {
 
         var data = response.get("data");
         var status = data instanceof Map<?, ?> dm ? String.valueOf(dm.get("status")) : null;
+        // Gateway failure reason (top-level message, else the data message).
+        String failMsg = null;
+        if (response.get("message") != null) failMsg = String.valueOf(response.get("message"));
+        if (failMsg == null && data instanceof Map<?, ?> dm2 && dm2.get("message") != null)
+            failMsg = String.valueOf(dm2.get("message"));
+        if ("FAILED".equalsIgnoreCase(status)) {
+            recordInitFailure("charge-failed", failMsg != null ? failMsg : "charge returned FAILED", maskPhone(phone));
+        }
         log.info("[ZentraPay][init] DONE — userId='{}' ref='{}' status='{}'", user.getId(), reference, status);
 
         var out = new LinkedHashMap<String, Object>();
         out.put("reference", reference);
         out.put("status", status == null ? "PENDING" : status);
+        if (failMsg != null) out.put("message", failMsg);
         return ResponseEntity.ok(ApiResponse.ok(out));
     }
 
