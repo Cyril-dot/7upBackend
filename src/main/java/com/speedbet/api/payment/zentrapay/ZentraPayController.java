@@ -9,6 +9,7 @@ import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRole;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
+import jakarta.annotation.PostConstruct;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -119,6 +120,20 @@ public class ZentraPayController {
     // The last init failure on this instance, so the super admin can see
     // WHY the last deposit died instead of the generic "internal error".
     // No secrets, no full phone — masked like the logs. Lost on restart.
+    // Guide v2 (Part 12 Step 2): startup check — log the ZentraPay host +
+    // gateway mode once at boot so a dead host or mock mode is visible in
+    // the Railway logs from the first line. Never breaks startup.
+    @PostConstruct
+    public void logZentraPayHealthAtStartup() {
+        try {
+            var h = probeHealth();
+            log.info("[ZentraPay][startup] baseUrl='{}' reachable={} status={} mode={} error={}",
+                    baseUrl, h.get("reachable"), h.get("status"), h.get("mode"), h.get("error"));
+        } catch (Exception e) {
+            log.warn("[ZentraPay][startup] health check failed — {}", e.getMessage());
+        }
+    }
+
     private static final AtomicReference<Map<String, Object>> LAST_INIT_FAILURE = new AtomicReference<>();
 
     private static void recordInitFailure(String kind, String detail, String phoneMasked) {
@@ -249,7 +264,26 @@ public class ZentraPayController {
         assertReferenceBelongsTo(user, ref);
         log.info("[ZentraPay][status] userId='{}' ref='{}'", user.getId(), ref);
 
-        var verified = zentraPayVerify(ref, secretKeyFor(user));
+        Map<String, Object> verified;
+        try {
+            verified = zentraPayVerify(ref, secretKeyFor(user));
+        } catch (ApiException e) {
+            // Guide v2 Step 5: PENDING is normal — a charge created moments
+            // ago may not be visible to verify yet (the gateway answers 404
+            // "reference not found"). Treat it as PENDING so the frontend
+            // poll keeps waiting instead of 400ing on every attempt.
+            if (e.getStatus() == HttpStatus.BAD_REQUEST
+                    && e.getMessage() != null
+                    && e.getMessage().toLowerCase().contains("not found")) {
+                log.info("[ZentraPay][status] verify 404 for ref='{}' — treating as PENDING", ref);
+                var out = new LinkedHashMap<String, Object>();
+                out.put("credited", false);
+                out.put("status", "pending");
+                out.put("message", "Payment is still pending.");
+                return ResponseEntity.ok(ApiResponse.ok(out));
+            }
+            throw e;
+        }
         var result = verifyResult(verified, ref);
         var status = String.valueOf(result.get("status"));
 
@@ -333,6 +367,14 @@ public class ZentraPayController {
                     .readValue(new String(rawBody, StandardCharsets.UTF_8), Map.class);
 
             var eventType = String.valueOf(event.get("event"));
+            if ("refund.processed".equals(eventType)) {
+                // Guide v2 Step 8: the gateway confirms a refund here.
+                // Refunds never touch the player wallet (the SA adjusts it
+                // by hand if needed) — log it and ack so it isn't retried.
+                var rref = refFromPayload != null ? refFromPayload : extractReference(event);
+                log.info("[ZentraPay][Webhook] refund.processed ref='{}' — no wallet change", rref);
+                return ResponseEntity.ok("OK-REFUND");
+            }
             if (!"charge.success".equals(eventType)) {
                 log.info("[ZentraPay][Webhook] Ignored event='{}'", eventType);
                 return ResponseEntity.ok("Ignored");
@@ -730,6 +772,7 @@ public class ZentraPayController {
             mono = mono.retryWhen(Retry.backoff(2, Duration.ofMillis(300))
                     .filter(ex -> ex instanceof TimeoutException
                             || ex instanceof WebClientRequestException
+                            || (ex instanceof UpstreamException u && u.status == 429)
                             || (ex instanceof UpstreamException u && u.status >= 500))
                     .onRetryExhaustedThrow((s, sig) -> sig.failure()));
         }
