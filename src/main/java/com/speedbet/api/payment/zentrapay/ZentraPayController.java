@@ -114,7 +114,10 @@ public class ZentraPayController {
 
     @Value("${app.zentrapay.secret-key:}")          private String     secretKey;
     @Value("${app.zentrapay.webhook-secret:}")      private String     webhookSecret;
-    @Value("${app.zentrapay.base-url:https://api.zentrapay.online}") private String baseUrl;
+    // Hard-coded production base (user order 21 Nov): the Railway env var
+    // kept overriding the default back to the mock host, so no env var
+    // can change this now. Production base per the official PDF.
+    private final String baseUrl = "https://api.zentrapay.online";
     @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
     // ─── Diagnostics (v186) ───────────────────────────────────────────────
