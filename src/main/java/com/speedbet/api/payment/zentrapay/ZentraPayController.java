@@ -259,7 +259,7 @@ public class ZentraPayController {
             recordInitFailure("charge-failed", failMsg != null ? failMsg : "charge returned FAILED", maskPhone(phone));
         }
         // Background verifier (v192): a PENDING charge is checked server-side
-        // every 10s and credited on SUCCESS even if the user leaves the page
+        // every 5s and credited on SUCCESS even if the user leaves the page
         // or the webhook never arrives. FAILED charges are never registered.
         if (status == null || "PENDING".equalsIgnoreCase(status)) {
             PENDING.put(reference, new PendingCharge(user.getId(), Instant.now()));
@@ -277,7 +277,7 @@ public class ZentraPayController {
     // Payment completion + verification happen server-side, fast, whether or
     // not the user stays on the deposit page and whether or not the webhook
     // arrives. Once init returns PENDING the reference is registered here;
-    // every 10s the verifier asks ZentraPay itself and credits on SUCCESS
+    // every 5s the verifier asks ZentraPay itself and credits on SUCCESS
     // (same idempotent creditFromVerified the poll + webhook use — a duplicate
     // 409 is swallowed, so it can never double-credit). FAILED drops out,
     // still-PENDING stays until the 5-minute cap (same window as the frontend
@@ -288,7 +288,7 @@ public class ZentraPayController {
 
     private static final ConcurrentHashMap<String, PendingCharge> PENDING = new ConcurrentHashMap<>();
 
-    @Scheduled(fixedDelay = 10000)
+    @Scheduled(fixedDelay = 5000)
     public void verifyPendingCharges() {
         if (PENDING.isEmpty()) return;
         var now = Instant.now();
