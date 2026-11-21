@@ -57,7 +57,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * ZentraPay (https://api.zentrapay.online) mobile-money deposit integration.
+ * ZentraPay (https://zentrapay-lyart.vercel.app) mobile-money deposit integration.
  *
  * Flow (direct MoMo prompt — no hosted checkout, no browser widget):
  *  1. POST /api/wallet/deposit/zentrapay/init {amount, phone, network?}
@@ -117,7 +117,12 @@ public class ZentraPayController {
     // Hard-coded production base (user order 21 Nov): the Railway env var
     // kept overriding the default back to the mock host, so no env var
     // can change this now. Production base per the official PDF.
-    private final String baseUrl = "https://api.zentrapay.online";
+    // REVERTED 21 Nov (v200): api.zentrapay.online does NOT resolve from
+    // Railway (DNS failure — backend 502s "could not resolve"). The PDF
+    // production host is dead from every network tried. The vercel host
+    // is the only one that answers, so we are back on it. It reports
+    // mode "mock" — the real fix is ZentraPay switching it to live.
+    private final String baseUrl = "https://zentrapay-lyart.vercel.app";
     @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
     // ─── Diagnostics (v186) ───────────────────────────────────────────────
