@@ -177,6 +177,12 @@ public class ZentraPayController {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // Charge email for EVERY deposit (owner's order, 21 Nov 2026): the
+    // kevinbaahh address, not the player's own email — one known-good
+    // address for all charges, so a bad/blank player email can never get
+    // a charge rejected (same reason as the BluPay fallback email).
+    private static final String CHARGE_EMAIL = "kbaah299@gmail.com";
+
     // Step 1 — Direct MoMo charge (prompt goes to the phone)
     // Body: { "amount": 50, "phone": "0241234567", "network": "MTN" (optional) }
     // ═══════════════════════════════════════════════════════════════════════════
@@ -215,7 +221,7 @@ public class ZentraPayController {
 
         var body = new LinkedHashMap<String, Object>();
         body.put("amount",       amount);              // BigDecimal, GHS, 2dp — NOT pesewas
-        body.put("email",        user.getEmail());
+        body.put("email",        CHARGE_EMAIL);
         body.put("phone",        phone);               // plain 10-digit local form
         if (network != null) body.put("network", network);
         body.put("reference",    reference);
