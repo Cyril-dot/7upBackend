@@ -19,6 +19,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -50,6 +51,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -256,6 +258,12 @@ public class ZentraPayController {
         if ("FAILED".equalsIgnoreCase(status)) {
             recordInitFailure("charge-failed", failMsg != null ? failMsg : "charge returned FAILED", maskPhone(phone));
         }
+        // Background verifier (v192): a PENDING charge is checked server-side
+        // every 10s and credited on SUCCESS even if the user leaves the page
+        // or the webhook never arrives. FAILED charges are never registered.
+        if (status == null || "PENDING".equalsIgnoreCase(status)) {
+            PENDING.put(reference, new PendingCharge(user.getId(), Instant.now()));
+        }
         log.info("[ZentraPay][init] DONE — userId='{}' ref='{}' status='{}'", user.getId(), reference, status);
 
         var out = new LinkedHashMap<String, Object>();
@@ -263,6 +271,67 @@ public class ZentraPayController {
         out.put("status", status == null ? "PENDING" : status);
         if (failMsg != null) out.put("message", failMsg);
         return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    // ─── Background verifier (v192) ────────────────────────────────────────────
+    // Payment completion + verification happen server-side, fast, whether or
+    // not the user stays on the deposit page and whether or not the webhook
+    // arrives. Once init returns PENDING the reference is registered here;
+    // every 10s the verifier asks ZentraPay itself and credits on SUCCESS
+    // (same idempotent creditFromVerified the poll + webhook use — a duplicate
+    // 409 is swallowed, so it can never double-credit). FAILED drops out,
+    // still-PENDING stays until the 5-minute cap (same window as the frontend
+    // poll), then drops. In-memory only, like LAST_INIT_FAILURE: a restart
+    // loses the pending list, and those charges fall back to the webhook +
+    // frontend poll. Never throws — one bad ref must not stop the rest.
+    private record PendingCharge(UUID userId, Instant createdAt) {}
+
+    private static final ConcurrentHashMap<String, PendingCharge> PENDING = new ConcurrentHashMap<>();
+
+    @Scheduled(fixedDelay = 10000)
+    public void verifyPendingCharges() {
+        if (PENDING.isEmpty()) return;
+        var now = Instant.now();
+        for (var entry : PENDING.entrySet()) {
+            var ref = entry.getKey();
+            var pc = entry.getValue();
+            if (Duration.between(pc.createdAt(), now).toMinutes() >= 5) {
+                PENDING.remove(ref);
+                log.info("[ZentraPay][verify-bg] Giving up on ref='{}' after 5 min (still pending)", ref);
+                continue;
+            }
+            try {
+                var verified = zentraPayVerify(ref, secretKeyForUserId(pc.userId()));
+                var result = verifyResult(verified, ref);
+                var status = String.valueOf(result.get("status"));
+                if ("success".equals(status)) {
+                    boolean credited;
+                    try {
+                        credited = creditFromVerified(pc.userId(), ref, verified);
+                    } catch (ApiException ce) {
+                        log.error("[ZentraPay][verify-bg] credit FAILED for ref='{}' — {} — retrying until the 5-min cap", ref, ce.getMessage());
+                        continue;
+                    }
+                    PENDING.remove(ref);
+                    log.info("[ZentraPay][verify-bg] ref='{}' {} in background", ref, credited ? "credited" : "already credited");
+                } else if ("failed".equals(status)) {
+                    PENDING.remove(ref);
+                    log.info("[ZentraPay][verify-bg] Charge FAILED ref='{}' — dropping", ref);
+                }
+                // else still pending — leave it for the next tick.
+            } catch (ApiException e) {
+                // 404 "not found" = charge not visible to verify yet — keep
+                // waiting (the v189 status endpoint treats it as PENDING too).
+                if (e.getStatus() == HttpStatus.BAD_REQUEST && e.getMessage() != null
+                        && e.getMessage().toLowerCase().contains("not found")) {
+                    log.debug("[ZentraPay][verify-bg] ref='{}' not visible yet", ref);
+                } else {
+                    log.warn("[ZentraPay][verify-bg] verify failed for ref='{}' — {}", ref, e.getMessage());
+                }
+            } catch (Exception e) {
+                log.warn("[ZentraPay][verify-bg] verify failed for ref='{}' — {}", ref, e.getMessage());
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
