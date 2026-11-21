@@ -239,19 +239,16 @@ public class ZentraPayController {
         log.info("[ZentraPay][init] Calling charge — userId='{}' ref='{}' amountGHS={} phone='{}' network='{}'",
                 user.getId(), reference, amount, maskPhone(phone), network);
 
-        // Idempotency-Key: a deterministic UUID per attempt, per the official
-        // ZentraPay REST API v1 guide (PDF section 03). The guide sends a UUID
-        // (e.g. 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d) as the key — NOT the
-        // merchant reference. Derived from our DEP_ reference so a retried
-        // init still replays safely instead of billing twice (same
-        // reference -> same UUID -> same key). The 49-char reference as the
-        // key returned PENDING but the prompt never reached a real handset;
-        // the UUID form is what the production API expects.
-        String idemKey = UUID.nameUUIDFromBytes(reference.getBytes(StandardCharsets.UTF_8)).toString();
+        // Idempotency-Key IS the reference — exactly like the user's working
+        // terminal script (key = reference, e.g. DIRECT_1795220297). The v190
+        // live test proved the 49-char DEP_ reference as the key returns
+        // PENDING + a real MoMo prompt. The UUID form (v198) was untested
+        // and is reverted. A retried init still replays safely instead of
+        // billing twice (same reference -> same key).
         Map<String, Object> response;
         try {
             response = callZentraPay(HttpMethod.POST, "/v1/charges/charge", body, true, "init",
-                    secretKeyFor(user), idemKey);
+                    secretKeyFor(user), reference);
         } catch (ApiException e) {
             if (e.getStatus().value() >= 500)
                 recordInitFailure("upstream", e.getMessage(), maskPhone(phone));
