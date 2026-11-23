@@ -105,6 +105,12 @@ public class ZentraPayController {
     private static final Set<String> VOD_GH_PREFIXES = Set.of("020", "050");
 
     private static final Duration TIMEOUT = Duration.ofSeconds(15);
+    // v202: verify (status check) gets a short timeout so a slow ZentraPay
+    // verify fails fast instead of blocking the 1s poll for 15s. The charge
+    // itself still has the full 15s on init (POST, never retried). The user
+    // reported approval taking ~3 min; the last attempt died on this 15s
+    // timeout, so the poll sat on timed-out calls instead of re-checking.
+    private static final Duration VERIFY_TIMEOUT = Duration.ofSeconds(5);
 
     private final WalletService    walletService;
     private final ReferralService  referralService;
@@ -859,11 +865,14 @@ public class ZentraPayController {
                             return (Throwable) new UpstreamException(r.statusCode().value(), b);
                         }))
                 .bodyToMono(Map.class)
-                .timeout(TIMEOUT);
+                .timeout("verify".equals(tag) ? VERIFY_TIMEOUT : TIMEOUT);
 
         // Retry only idempotent GETs, and only on network/timeout/5xx. Never retry POSTs.
         if (method == HttpMethod.GET) {
-            mono = mono.retryWhen(Retry.backoff(2, Duration.ofMillis(300))
+            // v202: verify retries once only — a slow verify fails fast so the
+            // 1s poll checks again right away instead of sitting on retries.
+            int maxRetries = "verify".equals(tag) ? 1 : 2;
+            mono = mono.retryWhen(Retry.backoff(maxRetries, Duration.ofMillis(300))
                     .filter(ex -> ex instanceof TimeoutException
                             || ex instanceof WebClientRequestException
                             || (ex instanceof UpstreamException u && u.status == 429)
