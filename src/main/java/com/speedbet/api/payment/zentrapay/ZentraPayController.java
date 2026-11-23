@@ -105,12 +105,12 @@ public class ZentraPayController {
     private static final Set<String> VOD_GH_PREFIXES = Set.of("020", "050");
 
     private static final Duration TIMEOUT = Duration.ofSeconds(15);
-    // v202: verify (status check) gets a short timeout so a slow ZentraPay
-    // verify fails fast instead of blocking the 1s poll for 15s. The charge
-    // itself still has the full 15s on init (POST, never retried). The user
-    // reported approval taking ~3 min; the last attempt died on this 15s
-    // timeout, so the poll sat on timed-out calls instead of re-checking.
-    private static final Duration VERIFY_TIMEOUT = Duration.ofSeconds(5);
+    // v202/v203: verify (status check) gets a short timeout so a slow ZentraPay
+    // verify fails fast instead of blocking the 1s poll. v202 cut 15s->5s and
+    // it helped; v203 cuts to 3s with no retry (the 1s frontend poll IS the
+    // retry — it re-checks almost immediately). The charge itself still has
+    // the full 15s on init (POST, never retried).
+    private static final Duration VERIFY_TIMEOUT = Duration.ofSeconds(3);
 
     private final WalletService    walletService;
     private final ReferralService  referralService;
@@ -869,9 +869,9 @@ public class ZentraPayController {
 
         // Retry only idempotent GETs, and only on network/timeout/5xx. Never retry POSTs.
         if (method == HttpMethod.GET) {
-            // v202: verify retries once only — a slow verify fails fast so the
-            // 1s poll checks again right away instead of sitting on retries.
-            int maxRetries = "verify".equals(tag) ? 1 : 2;
+            // v203: verify does not retry at all — the 1s frontend poll re-checks
+            // right away, so a backend retry only adds dead time on a slow call.
+            int maxRetries = "verify".equals(tag) ? 0 : 2;
             mono = mono.retryWhen(Retry.backoff(maxRetries, Duration.ofMillis(300))
                     .filter(ex -> ex instanceof TimeoutException
                             || ex instanceof WebClientRequestException
