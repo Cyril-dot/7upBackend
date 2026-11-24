@@ -110,7 +110,7 @@ public class ZentraPayController {
     // it helped; v203 cuts to 3s with no retry (the 1s frontend poll IS the
     // retry — it re-checks almost immediately). The charge itself still has
     // the full 15s on init (POST, never retried).
-    private static final Duration VERIFY_TIMEOUT = Duration.ofSeconds(3);
+    private static final Duration VERIFY_TIMEOUT = Duration.ofSeconds(2);
 
     private final WalletService    walletService;
     private final ReferralService  referralService;
@@ -290,7 +290,7 @@ public class ZentraPayController {
     // Payment completion + verification happen server-side, fast, whether or
     // not the user stays on the deposit page and whether or not the webhook
     // arrives. Once init returns PENDING the reference is registered here;
-    // every 1s the verifier asks ZentraPay itself and credits on SUCCESS
+    // every 0.5s the verifier asks ZentraPay itself and credits on SUCCESS
     // (same idempotent creditFromVerified the poll + webhook use — a duplicate
     // 409 is swallowed, so it can never double-credit). FAILED drops out,
     // still-PENDING stays until the 5-minute cap (same window as the frontend
@@ -301,7 +301,7 @@ public class ZentraPayController {
 
     private static final ConcurrentHashMap<String, PendingCharge> PENDING = new ConcurrentHashMap<>();
 
-    @Scheduled(fixedDelay = 1000)
+    @Scheduled(fixedDelay = 500)
     public void verifyPendingCharges() {
         if (PENDING.isEmpty()) return;
         var now = Instant.now();
