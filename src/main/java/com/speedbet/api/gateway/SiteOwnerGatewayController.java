@@ -85,7 +85,7 @@ public class SiteOwnerGatewayController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> platformKeys() {
         var out = new LinkedHashMap<String, Object>();
         out.put("alphaPayKeys", gatewayService.platformAlphaPayKeyStatus());
-        out.put("rushPayKeys", gatewayService.platformRushPayKeyStatus());
+        out.put("cediLinkKeys", gatewayService.platformCediLinkKeyStatus());
         out.put("zentraPayKeys", gatewayService.platformZentraPayKeyStatus());
         return ResponseEntity.ok(ApiResponse.ok(out));
     }
@@ -109,25 +109,6 @@ public class SiteOwnerGatewayController {
                         : "Platform AlphaPay key saved."));
     }
 
-    /**
-     * Site-owner write of the PLATFORM (general) RushPay API key + webhook
-     * secret. Body: {"apiKey": "rp_...", "webhookSecret": "..."} to set, or
-     * {"clear": true} to remove them and go back to the env keys. These are
-     * the keys used when a branch has NOT set its own — the general keys
-     * for the whole platform, set from the app with no server access needed.
-     */
-    @PutMapping("/platform-keys/rushpay")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> setPlatformRushPayKey(
-            @AuthenticationPrincipal User owner,
-            @RequestBody Map<String, Object> req) {
-        boolean clear = Boolean.TRUE.equals(req.get("clear"));
-        String apiKey = req.get("apiKey") == null ? null : String.valueOf(req.get("apiKey"));
-        String webhookSecret = req.get("webhookSecret") == null ? null : String.valueOf(req.get("webhookSecret"));
-        return ResponseEntity.ok(ApiResponse.ok(
-                gatewayService.setPlatformRushPayKey(owner, apiKey, webhookSecret, clear),
-                clear ? "Platform RushPay keys removed — deposits now use the env keys."
-                        : "Platform RushPay keys saved."));
-    }
     /**
      * Site-owner write of the PLATFORM (general) ZentraPay secret key +
      * webhook secret. Body: {"secretKey": "sk_live_...", "webhookSecret":
@@ -157,6 +138,39 @@ public class SiteOwnerGatewayController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> revealPlatformZentraPayKeys(
             @AuthenticationPrincipal User owner) {
         return ResponseEntity.ok(ApiResponse.ok(gatewayService.revealPlatformZentraPayKeys(owner)));
+    }
+
+    /**
+     * Site-owner write of the PLATFORM (general) CediLink secret key +
+     * webhook secret. Body: {"secretKey": "sk_live_...", "webhookSecret":
+     * "..."} to set, or {"clear": true} to remove them and go back to the
+     * env keys. These are the keys used when a branch has NOT set its own
+     * — the general keys for the whole platform, set from the app with no
+     * server access needed. CediLink is the platform/default Ghana
+     * gateway, so this is the key that runs deposits for every branch
+     * that has not set its own.
+     */
+    @PutMapping("/platform-keys/cedilink")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setPlatformCediLinkKey(
+            @AuthenticationPrincipal User owner,
+            @RequestBody Map<String, Object> req) {
+        boolean clear = Boolean.TRUE.equals(req.get("clear"));
+        String secretKey = req.get("secretKey") == null ? null : String.valueOf(req.get("secretKey"));
+        String webhookSecret = req.get("webhookSecret") == null ? null : String.valueOf(req.get("webhookSecret"));
+        return ResponseEntity.ok(ApiResponse.ok(
+                gatewayService.setPlatformCediLinkKey(owner, secretKey, webhookSecret, clear),
+                clear ? "Platform CediLink keys removed — deposits now use the env keys."
+                        : "Platform CediLink keys saved."));
+    }
+
+    /**
+     * Decrypted platform CediLink keys for the eye toggle in the owner
+     * panel. Site-owner only, audit-logged in the service.
+     */
+    @GetMapping("/platform-keys/cedilink/reveal")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> revealPlatformCediLinkKeys(
+            @AuthenticationPrincipal User owner) {
+        return ResponseEntity.ok(ApiResponse.ok(gatewayService.revealPlatformCediLinkKeys(owner)));
     }
 
 }

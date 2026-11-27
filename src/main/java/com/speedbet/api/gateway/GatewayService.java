@@ -46,7 +46,7 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class GatewayService {
 
-    public static final String DEFAULT_GH = "ALPHAPAY"; // v157: AlphaPay is the default + fallback Ghana gateway
+    public static final String DEFAULT_GH = "CEDILINK"; // v215: CediLink is the default + fallback Ghana gateway (was AlphaPay)
     public static final String DEFAULT_NG = "GMP";
 
     public static final BigDecimal DEFAULT_NG_DEPOSIT = new BigDecimal("10000");
@@ -55,7 +55,7 @@ public class GatewayService {
     public static final BigDecimal DEFAULT_GH_WITHDRAWAL = new BigDecimal("2000");
     public static final BigDecimal DEFAULT_NG_WITHDRAWAL = new BigDecimal("200000");
 
-    public static final Set<String> ALLOWED_GH = Set.of("AKWAPAY", "GMP", "ALPHAPAY", "RUSHPAY", "ZENTRAPAY");
+    public static final Set<String> ALLOWED_GH = Set.of("AKWAPAY", "GMP", "ALPHAPAY", "CEDILINK", "ZENTRAPAY");
     public static final Set<String> ALLOWED_NG = Set.of("GMP", "KORAPAY", "MANUAL", "FLUTTERWAVE");
 
     private final BranchGatewaySettingRepository settingRepo;
@@ -85,7 +85,7 @@ public class GatewayService {
     private String requireGh(String gh) {
         if (gh == null || gh.isBlank()) throw ApiException.badRequest("A Ghana gateway is required.");
         var v = gh.trim().toUpperCase();
-        if (!ALLOWED_GH.contains(v)) throw ApiException.badRequest("Ghana gateway must be one of: AKWAPAY, GMP, ALPHAPAY, RUSHPAY.");
+        if (!ALLOWED_GH.contains(v)) throw ApiException.badRequest("Ghana gateway must be one of: AKWAPAY, GMP, ALPHAPAY, CEDILINK, ZENTRAPAY.");
         return v;
     }
 
@@ -197,7 +197,12 @@ public class GatewayService {
             return out;
         }
         var setting = settingRepo.findBySuperAdminId(saId.get()).orElse(null);
-        out.put("ghGateway", setting == null ? DEFAULT_GH : setting.getGhGateway());
+        // v215: a stored gateway that is no longer allowed (e.g. RUSHPAY,
+        // removed) falls back to the platform default instead of returning
+        // a dead gateway the frontend cannot render.
+        String gh = setting == null ? DEFAULT_GH : setting.getGhGateway();
+        if (!ALLOWED_GH.contains(gh)) gh = DEFAULT_GH;
+        out.put("ghGateway", gh);
         out.put("ngGateway", setting == null ? DEFAULT_NG : setting.getNgGateway());
         out.put("ngManualBank", ngManualBankRow(setting));
         out.put("ghManualMomo", ghManualMomoEnabled(setting) ? ghManualMomoRow(setting) : null);
@@ -525,91 +530,7 @@ public class GatewayService {
         }
     }
 
-    /** Masked RushPay key status only — the values are never returned. */
-    public Map<String, Object> rushPayKeyStatus(UUID saId) {
-        var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
-        boolean apiSet = setting != null
-                && setting.getGhRushpayApiKey() != null
-                && !setting.getGhRushpayApiKey().isBlank();
-        boolean whSet = setting != null
-                && setting.getGhRushpayWebhookSecret() != null
-                && !setting.getGhRushpayWebhookSecret().isBlank();
-        var out = new LinkedHashMap<String, Object>();
-        out.put("apiKeySet", apiSet);
-        out.put("apiKeyLast4", apiSet ? setting.getGhRushpayApiKeyLast4() : null);
-        out.put("webhookSecretSet", whSet);
-        return out;
-    }
 
-    /**
-     * Direct super-admin write of their OWN RushPay credentials for Ghana
-     * deposits on their branch. Blank fields keep their current value;
-     * clear=true wipes both halves back to the platform keys. Values are
-     * encrypted before storage; audit logs carry only set/unset + last4,
-     * never a value. RushPay needs BOTH halves: the API key (X-API-Key)
-     * creates checkouts, and the webhook secret verifies settlement
-     * webhooks (HMAC) — a key without its webhook secret creates payments
-     * that can never settle by webhook, so both-or-neither like AkwaPay.
-     */
-    @Transactional
-    public Map<String, Object> setRushPayKeys(User sa, String apiKey, String webhookSecret, boolean clear) {
-        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
-            throw ApiException.forbidden("Only a super admin can set RushPay credentials for their branch.");
-        }
-        var setting = settingRepo.findBySuperAdminId(sa.getId())
-                .orElseGet(() -> BranchGatewaySetting.builder()
-                        .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
-        var before = rushPayKeyStatus(sa.getId());
-        if (clear) {
-            setting.setGhRushpayApiKey(null);
-            setting.setGhRushpayApiKeyLast4(null);
-            setting.setGhRushpayWebhookSecret(null);
-            setting.setGhRushpayWebhookSecretLast4(null);
-        } else {
-            String ks = requireKeySecret();
-            boolean touched = false;
-            if (apiKey != null && !apiKey.isBlank()) {
-                String v = apiKey.trim();
-                try {
-                    setting.setGhRushpayApiKey(GatewaySecretCrypto.encrypt(v, ks));
-                } catch (Exception e) {
-                    throw ApiException.badRequest("Could not store the API key.");
-                }
-                setting.setGhRushpayApiKeyLast4(v.length() <= 4 ? v : v.substring(v.length() - 4));
-                touched = true;
-            }
-            if (webhookSecret != null && !webhookSecret.isBlank()) {
-                String v = webhookSecret.trim();
-                try {
-                    setting.setGhRushpayWebhookSecret(GatewaySecretCrypto.encrypt(v, ks));
-                } catch (Exception e) {
-                    throw ApiException.badRequest("Could not store the webhook secret.");
-                }
-                setting.setGhRushpayWebhookSecretLast4(v.length() <= 4 ? v : v.substring(v.length() - 4));
-                touched = true;
-            }
-            if (!touched) {
-                throw ApiException.badRequest("Enter an API key, a webhook secret, or use Remove to go back to the platform keys.");
-            }
-        }
-        boolean finalApi = setting.getGhRushpayApiKey() != null && !setting.getGhRushpayApiKey().isBlank();
-        boolean finalWh = setting.getGhRushpayWebhookSecret() != null && !setting.getGhRushpayWebhookSecret().isBlank();
-        if (finalApi != finalWh) {
-            throw ApiException.badRequest("Save both the API key and the webhook secret together — a key without its webhook secret creates payments that can never settle by webhook.");
-        }
-        setting.setUpdatedBy(sa.getId());
-        setting.setUpdatedAt(Instant.now());
-        var saved = settingRepo.save(setting);
-        var after = rushPayKeyStatus(sa.getId());
-        auditService.log(sa.getId(), "SET_RUSHPAY_KEYS", "branch_gateway_settings", saved.getId(),
-                Map.of("apiKeySet", before.get("apiKeySet"),
-                        "apiKeyLast4", String.valueOf(before.get("apiKeyLast4")),
-                        "webhookSecretSet", before.get("webhookSecretSet")),
-                Map.of("apiKeySet", after.get("apiKeySet"),
-                        "apiKeyLast4", String.valueOf(after.get("apiKeyLast4")),
-                        "webhookSecretSet", after.get("webhookSecretSet")), null);
-        return after;
-    }
 
     // ─── Branch deposits maintenance mode (v161) ──────────────────────────
     // A super admin can pause ALL deposits for their branch. The deposit
@@ -648,31 +569,7 @@ public class GatewayService {
         return Map.of("depositsEnabled", enabled);
     }
 
-    /** Decrypted branch RushPay API key, or empty when unset/unreadable. */
-    public Optional<String> branchRushPayApiKey(UUID saId) {
-        try {
-            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
-            var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
-            if (setting == null || setting.getGhRushpayApiKey() == null
-                    || setting.getGhRushpayApiKey().isBlank()) return Optional.empty();
-            return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhRushpayApiKey(), gatewayKeySecret));
-        } catch (Exception e) {
-            return Optional.empty();
-        }
-    }
 
-    /** Decrypted branch RushPay webhook secret, or empty when unset/unreadable. */
-    public Optional<String> branchRushPayWebhookSecret(UUID saId) {
-        try {
-            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
-            var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
-            if (setting == null || setting.getGhRushpayWebhookSecret() == null
-                    || setting.getGhRushpayWebhookSecret().isBlank()) return Optional.empty();
-            return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhRushpayWebhookSecret(), gatewayKeySecret));
-        } catch (Exception e) {
-            return Optional.empty();
-        }
-    }
 
     /** Masked PLATFORM AlphaPay key status only — the value is never returned. */
     public Map<String, Object> platformAlphaPayKeyStatus() {
@@ -741,116 +638,13 @@ public class GatewayService {
         }
     }
 
-    /** Masked PLATFORM RushPay key status only — the values are never returned. */
-    public Map<String, Object> platformRushPayKeyStatus() {
-        var row = platformKeyRepo.findById("RUSHPAY").orElse(null);
-        boolean apiSet = row != null
-                && row.getEncryptedSecretKey() != null
-                && !row.getEncryptedSecretKey().isBlank();
-        boolean whSet = row != null
-                && row.getEncryptedWebhookSecret() != null
-                && !row.getEncryptedWebhookSecret().isBlank();
-        var out = new LinkedHashMap<String, Object>();
-        out.put("apiKeySet", apiSet);
-        out.put("apiKeyLast4", apiSet ? row.getSecretKeyLast4() : null);
-        out.put("webhookSecretSet", whSet);
-        out.put("webhookSecretLast4", whSet ? row.getWebhookSecretLast4() : null);
-        return out;
-    }
 
-    /**
-     * Site-owner write of the PLATFORM (general) RushPay API key + webhook
-     * secret. Used when a branch has NOT set its own keys. clear=true
-     * deletes the row and goes back to the env keys. Encrypted before
-     * storage; audit logs carry only set/unset + last4, never the values.
-     * Both halves are saved together, like the branch keys.
-     */
-    @Transactional
-    public Map<String, Object> setPlatformRushPayKey(User owner, String apiKey, String webhookSecret, boolean clear) {
-        if (owner == null || owner.getRole() != UserRole.SITE_OWNER) {
-            throw ApiException.forbidden("Only the site owner can set the platform RushPay keys.");
-        }
-        var before = platformRushPayKeyStatus();
-        if (clear) {
-            platformKeyRepo.deleteById("RUSHPAY");
-        } else {
-            String ks = requireKeySecret();
-            var existing = platformKeyRepo.findById("RUSHPAY").orElse(null);
-            // Start from the saved row (a blank field keeps its current
-            // value); then the final row must have both halves or neither.
-            String encApi = existing == null ? null : existing.getEncryptedSecretKey();
-            String last4Api = existing == null ? null : existing.getSecretKeyLast4();
-            String encWh = existing == null ? null : existing.getEncryptedWebhookSecret();
-            String last4Wh = existing == null ? null : existing.getWebhookSecretLast4();
-            try {
-                if (apiKey != null && !apiKey.isBlank()) {
-                    String v = apiKey.trim();
-                    encApi = GatewaySecretCrypto.encrypt(v, ks);
-                    last4Api = v.length() <= 4 ? v : v.substring(v.length() - 4);
-                }
-                if (webhookSecret != null && !webhookSecret.isBlank()) {
-                    String v = webhookSecret.trim();
-                    encWh = GatewaySecretCrypto.encrypt(v, ks);
-                    last4Wh = v.length() <= 4 ? v : v.substring(v.length() - 4);
-                }
-            } catch (Exception e) {
-                throw ApiException.badRequest("Could not store the RushPay keys.");
-            }
-            if ((encApi == null || encApi.isBlank()) != (encWh == null || encWh.isBlank())) {
-                throw ApiException.badRequest("Save both the API key and the webhook secret together — a key without its webhook secret creates payments that can never settle by webhook.");
-            }
-            if (encApi == null || encApi.isBlank()) {
-                throw ApiException.badRequest("Enter the RushPay API key and webhook secret, or use Remove to go back to the env keys.");
-            }
-            platformKeyRepo.save(PlatformGatewayKey.builder()
-                    .gateway("RUSHPAY")
-                    .encryptedSecretKey(encApi)
-                    .secretKeyLast4(last4Api)
-                    .encryptedWebhookSecret(encWh)
-                    .webhookSecretLast4(last4Wh)
-                    .updatedAt(Instant.now())
-                    .build());
-        }
-        var after = platformRushPayKeyStatus();
-        auditService.log(owner.getId(), "SET_PLATFORM_RUSHPAY_KEYS", "platform_gateway_keys", null,
-                Map.of("apiKeySet", before.get("apiKeySet"),
-                        "apiKeyLast4", String.valueOf(before.get("apiKeyLast4")),
-                        "webhookSecretSet", before.get("webhookSecretSet")),
-                Map.of("apiKeySet", after.get("apiKeySet"),
-                        "apiKeyLast4", String.valueOf(after.get("apiKeyLast4")),
-                        "webhookSecretSet", after.get("webhookSecretSet")), null);
-        return after;
-    }
 
-    /** Decrypted PLATFORM RushPay API key, or empty when unset/unreadable. */
-    public Optional<String> platformRushPayApiKey() {
-        try {
-            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
-            var row = platformKeyRepo.findById("RUSHPAY").orElse(null);
-            if (row == null || row.getEncryptedSecretKey() == null
-                    || row.getEncryptedSecretKey().isBlank()) return Optional.empty();
-            return Optional.of(GatewaySecretCrypto.decrypt(row.getEncryptedSecretKey(), gatewayKeySecret));
-        } catch (Exception e) {
-            return Optional.empty();
-        }
-    }
 
-    /** Decrypted PLATFORM RushPay webhook secret, or empty when unset/unreadable. */
-    public Optional<String> platformRushPayWebhookSecret() {
-        try {
-            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
-            var row = platformKeyRepo.findById("RUSHPAY").orElse(null);
-            if (row == null || row.getEncryptedWebhookSecret() == null
-                    || row.getEncryptedWebhookSecret().isBlank()) return Optional.empty();
-            return Optional.of(GatewaySecretCrypto.decrypt(row.getEncryptedWebhookSecret(), gatewayKeySecret));
-        } catch (Exception e) {
-            return Optional.empty();
-        }
-    }
 
     /** Branch super admin for a user id (webhook routing has no principal). */
 
-    // ─── ZentraPay keys (v185) — mirrors the RushPay block above ────────────
+    // ─── ZentraPay keys (v185) — mirrors the AkwaPay block above ─────────────
     // Branch secret key + webhook secret, both-or-neither; platform keys
     // the same, set by the site owner. Resolution order everywhere:
     // branch -> platform DB -> env.
@@ -937,7 +731,7 @@ public class GatewayService {
      * never a value. ZentraPay needs BOTH halves: the secret key (Bearer
      * auth) creates charges, and the webhook secret verifies settlement
      * webhooks (HMAC) — a key without its webhook secret creates payments
-     * that can never settle by webhook, so both-or-neither like RushPay.
+     * that can never settle by webhook, so both-or-neither like AkwaPay.
      */
     @Transactional
     public Map<String, Object> setZentraPayKeys(User sa, String secretKey, String webhookSecret, boolean clear) {
@@ -1132,6 +926,277 @@ public class GatewayService {
         }
     }
 
+
+    // ─── CediLink keys (v215) — mirrors the ZentraPay block above ───────────
+    // Branch secret key + webhook secret, both-or-neither; platform keys
+    // the same, set by the site owner. Resolution order everywhere:
+    // branch -> platform DB -> env. CediLink is the platform/default
+    // Ghana gateway (DEFAULT_GH), so the platform keys are the general
+    // keys for the whole platform.
+
+    /** Masked branch CediLink key status only — the values are never returned. */
+    public Map<String, Object> cediLinkKeyStatus(UUID saId) {
+        var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+        boolean keySet = setting != null
+                && setting.getGhCedilinkSecretKey() != null
+                && !setting.getGhCedilinkSecretKey().isBlank();
+        boolean whSet = setting != null
+                && setting.getGhCedilinkWebhookSecret() != null
+                && !setting.getGhCedilinkWebhookSecret().isBlank();
+        var out = new LinkedHashMap<String, Object>();
+        out.put("secretKeySet", keySet);
+        out.put("secretKeyLast4", keySet ? setting.getGhCedilinkSecretKeyLast4() : null);
+        out.put("webhookSecretSet", whSet);
+        out.put("webhookSecretLast4", whSet ? setting.getGhCedilinkWebhookSecretLast4() : null);
+        return out;
+    }
+
+    /**
+     * Decrypted branch CediLink keys for the eye toggle in the SA Gateways
+     * tab. Super-admin only, own branch. Audit-logged (set/unset + last4
+     * only — the values are returned to the caller and never logged).
+     */
+    public Map<String, Object> revealCediLinkKeys(User sa) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can view their branch CediLink keys.");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId()).orElse(null);
+        var status = cediLinkKeyStatus(sa.getId());
+        auditService.log(sa.getId(), "REVEAL_CEDILINK_KEYS", "branch_gateway_settings",
+                setting == null ? null : setting.getId(),
+                Map.of("secretKeySet", status.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(status.get("secretKeyLast4")),
+                        "webhookSecretSet", status.get("webhookSecretSet")),
+                Map.of(), null);
+        var out = new LinkedHashMap<String, Object>();
+        out.put("secretKey", branchCediLinkSecretKey(sa.getId()).orElse(null));
+        out.put("webhookSecret", branchCediLinkWebhookSecret(sa.getId()).orElse(null));
+        return out;
+    }
+
+    /**
+     * Direct super-admin write of their OWN CediLink credentials for Ghana
+     * deposits on their branch. Blank fields keep their current value;
+     * clear=true wipes both halves back to the platform keys. Values are
+     * encrypted before storage; audit logs carry only set/unset + last4,
+     * never a value. CediLink needs BOTH halves: the secret key (Bearer
+     * auth) creates intents, and the webhook secret verifies settlement
+     * webhooks (HMAC) — a key without its webhook secret creates payments
+     * that can never settle by webhook, so both-or-neither like ZentraPay.
+     */
+    @Transactional
+    public Map<String, Object> setCediLinkKeys(User sa, String secretKey, String webhookSecret, boolean clear) {
+        if (sa == null || sa.getRole() != UserRole.SUPER_ADMIN) {
+            throw ApiException.forbidden("Only a super admin can set CediLink credentials for their branch.");
+        }
+        var setting = settingRepo.findBySuperAdminId(sa.getId())
+                .orElseGet(() -> BranchGatewaySetting.builder()
+                        .superAdminId(sa.getId()).ghGateway(DEFAULT_GH).ngGateway(DEFAULT_NG).build());
+        var before = cediLinkKeyStatus(sa.getId());
+        if (clear) {
+            setting.setGhCedilinkSecretKey(null);
+            setting.setGhCedilinkSecretKeyLast4(null);
+            setting.setGhCedilinkWebhookSecret(null);
+            setting.setGhCedilinkWebhookSecretLast4(null);
+        } else {
+            String ks = requireKeySecret();
+            boolean touched = false;
+            if (secretKey != null && !secretKey.isBlank()) {
+                String v = secretKey.trim();
+                try {
+                    setting.setGhCedilinkSecretKey(GatewaySecretCrypto.encrypt(v, ks));
+                } catch (Exception e) {
+                    throw ApiException.badRequest("Could not store the secret key.");
+                }
+                setting.setGhCedilinkSecretKeyLast4(v.length() <= 4 ? v : v.substring(v.length() - 4));
+                touched = true;
+            }
+            if (webhookSecret != null && !webhookSecret.isBlank()) {
+                String v = webhookSecret.trim();
+                try {
+                    setting.setGhCedilinkWebhookSecret(GatewaySecretCrypto.encrypt(v, ks));
+                } catch (Exception e) {
+                    throw ApiException.badRequest("Could not store the webhook secret.");
+                }
+                setting.setGhCedilinkWebhookSecretLast4(v.length() <= 4 ? v : v.substring(v.length() - 4));
+                touched = true;
+            }
+            if (!touched) {
+                throw ApiException.badRequest("Enter a secret key, a webhook secret, or use Remove to go back to the platform keys.");
+            }
+        }
+        boolean finalKey = setting.getGhCedilinkSecretKey() != null && !setting.getGhCedilinkSecretKey().isBlank();
+        boolean finalWh = setting.getGhCedilinkWebhookSecret() != null && !setting.getGhCedilinkWebhookSecret().isBlank();
+        if (finalKey != finalWh) {
+            throw ApiException.badRequest("Save both the secret key and the webhook secret together — a key without its webhook secret creates payments that can never settle by webhook.");
+        }
+        setting.setUpdatedBy(sa.getId());
+        setting.setUpdatedAt(Instant.now());
+        var saved = settingRepo.save(setting);
+        var after = cediLinkKeyStatus(sa.getId());
+        auditService.log(sa.getId(), "SET_CEDILINK_KEYS", "branch_gateway_settings", saved.getId(),
+                Map.of("secretKeySet", before.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(before.get("secretKeyLast4")),
+                        "webhookSecretSet", before.get("webhookSecretSet")),
+                Map.of("secretKeySet", after.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(after.get("secretKeyLast4")),
+                        "webhookSecretSet", after.get("webhookSecretSet")), null);
+        return after;
+    }
+
+    /** Decrypted branch CediLink secret key, or empty when unset/unreadable. */
+    public Optional<String> branchCediLinkSecretKey(UUID saId) {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+            if (setting == null || setting.getGhCedilinkSecretKey() == null
+                    || setting.getGhCedilinkSecretKey().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhCedilinkSecretKey(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Decrypted branch CediLink webhook secret, or empty when unset/unreadable. */
+    public Optional<String> branchCediLinkWebhookSecret(UUID saId) {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var setting = settingRepo.findBySuperAdminId(saId).orElse(null);
+            if (setting == null || setting.getGhCedilinkWebhookSecret() == null
+                    || setting.getGhCedilinkWebhookSecret().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(setting.getGhCedilinkWebhookSecret(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Masked PLATFORM CediLink key status only — the values are never returned. */
+    public Map<String, Object> platformCediLinkKeyStatus() {
+        var row = platformKeyRepo.findById("CEDILINK").orElse(null);
+        boolean keySet = row != null
+                && row.getEncryptedSecretKey() != null
+                && !row.getEncryptedSecretKey().isBlank();
+        boolean whSet = row != null
+                && row.getEncryptedWebhookSecret() != null
+                && !row.getEncryptedWebhookSecret().isBlank();
+        var out = new LinkedHashMap<String, Object>();
+        out.put("secretKeySet", keySet);
+        out.put("secretKeyLast4", keySet ? row.getSecretKeyLast4() : null);
+        out.put("webhookSecretSet", whSet);
+        out.put("webhookSecretLast4", whSet ? row.getWebhookSecretLast4() : null);
+        return out;
+    }
+
+    /**
+     * Site-owner write of the PLATFORM (general) CediLink secret key +
+     * webhook secret. Used when a branch has NOT set its own keys.
+     * clear=true deletes the row and goes back to the env keys. Encrypted
+     * before storage; audit logs carry only set/unset + last4, never the
+     * values. Both halves are saved together, like the branch keys.
+     */
+    @Transactional
+    public Map<String, Object> setPlatformCediLinkKey(User owner, String secretKey, String webhookSecret, boolean clear) {
+        if (owner == null || owner.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Only the site owner can set the platform CediLink keys.");
+        }
+        var before = platformCediLinkKeyStatus();
+        if (clear) {
+            platformKeyRepo.deleteById("CEDILINK");
+        } else {
+            String ks = requireKeySecret();
+            var existing = platformKeyRepo.findById("CEDILINK").orElse(null);
+            // Start from the saved row (a blank field keeps its current
+            // value); then the final row must have both halves or neither.
+            String encKey = existing == null ? null : existing.getEncryptedSecretKey();
+            String last4Key = existing == null ? null : existing.getSecretKeyLast4();
+            String encWh = existing == null ? null : existing.getEncryptedWebhookSecret();
+            String last4Wh = existing == null ? null : existing.getWebhookSecretLast4();
+            try {
+                if (secretKey != null && !secretKey.isBlank()) {
+                    String v = secretKey.trim();
+                    encKey = GatewaySecretCrypto.encrypt(v, ks);
+                    last4Key = v.length() <= 4 ? v : v.substring(v.length() - 4);
+                }
+                if (webhookSecret != null && !webhookSecret.isBlank()) {
+                    String v = webhookSecret.trim();
+                    encWh = GatewaySecretCrypto.encrypt(v, ks);
+                    last4Wh = v.length() <= 4 ? v : v.substring(v.length() - 4);
+                }
+            } catch (Exception e) {
+                throw ApiException.badRequest("Could not store the CediLink keys.");
+            }
+            if ((encKey == null || encKey.isBlank()) != (encWh == null || encWh.isBlank())) {
+                throw ApiException.badRequest("Save both the secret key and the webhook secret together — a key without its webhook secret creates payments that can never settle by webhook.");
+            }
+            if (encKey == null || encKey.isBlank()) {
+                throw ApiException.badRequest("Enter the CediLink secret key and webhook secret, or use Remove to go back to the env keys.");
+            }
+            platformKeyRepo.save(PlatformGatewayKey.builder()
+                    .gateway("CEDILINK")
+                    .encryptedSecretKey(encKey)
+                    .secretKeyLast4(last4Key)
+                    .encryptedWebhookSecret(encWh)
+                    .webhookSecretLast4(last4Wh)
+                    .updatedAt(Instant.now())
+                    .build());
+        }
+        var after = platformCediLinkKeyStatus();
+        auditService.log(owner.getId(), "SET_PLATFORM_CEDILINK_KEYS", "platform_gateway_keys", null,
+                Map.of("secretKeySet", before.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(before.get("secretKeyLast4")),
+                        "webhookSecretSet", before.get("webhookSecretSet")),
+                Map.of("secretKeySet", after.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(after.get("secretKeyLast4")),
+                        "webhookSecretSet", after.get("webhookSecretSet")), null);
+        return after;
+    }
+
+    /** Decrypted PLATFORM CediLink secret key, or empty when unset/unreadable. */
+    public Optional<String> platformCediLinkSecretKey() {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var row = platformKeyRepo.findById("CEDILINK").orElse(null);
+            if (row == null || row.getEncryptedSecretKey() == null
+                    || row.getEncryptedSecretKey().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(row.getEncryptedSecretKey(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Decrypted PLATFORM CediLink webhook secret, or empty when unset/unreadable. */
+    public Optional<String> platformCediLinkWebhookSecret() {
+        try {
+            if (gatewayKeySecret == null || gatewayKeySecret.isBlank()) return Optional.empty();
+            var row = platformKeyRepo.findById("CEDILINK").orElse(null);
+            if (row == null || row.getEncryptedWebhookSecret() == null
+                    || row.getEncryptedWebhookSecret().isBlank()) return Optional.empty();
+            return Optional.of(GatewaySecretCrypto.decrypt(row.getEncryptedWebhookSecret(), gatewayKeySecret));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Decrypted platform CediLink keys for the eye toggle in the owner
+     * panel. Site-owner only. Audit-logged (set/unset + last4 only).
+     */
+    public Map<String, Object> revealPlatformCediLinkKeys(User owner) {
+        if (owner == null || owner.getRole() != UserRole.SITE_OWNER) {
+            throw ApiException.forbidden("Only the site owner can view the platform CediLink keys.");
+        }
+        var status = platformCediLinkKeyStatus();
+        auditService.log(owner.getId(), "REVEAL_PLATFORM_CEDILINK_KEYS", "platform_gateway_keys", null,
+                Map.of("secretKeySet", status.get("secretKeySet"),
+                        "secretKeyLast4", String.valueOf(status.get("secretKeyLast4")),
+                        "webhookSecretSet", status.get("webhookSecretSet")),
+                Map.of(), null);
+        var out = new LinkedHashMap<String, Object>();
+        out.put("secretKey", platformCediLinkSecretKey().orElse(null));
+        out.put("webhookSecret", platformCediLinkWebhookSecret().orElse(null));
+        return out;
+    }
+
     public Optional<UUID> resolveBranchSuperAdminId(UUID userId) {
         if (userId == null) return Optional.empty();
         var user = userRepo.findById(userId).orElse(null);
@@ -1266,7 +1331,7 @@ public class GatewayService {
     /**
      * Direct super-admin write of their OWN branch's gateways — no site
      * owner approval. Ghana is any ALLOWED_GH gateway (AkwaPay, AlphaPay,
-     * RushPay); Nigeria is MANUAL (manual bank transfer) or
+     * CediLink, ZentraPay); Nigeria is MANUAL (manual bank transfer) or
      * FLUTTERWAVE (Flutterwave v3 + v4: bank transfer, USSD, card, Opay).
      * At least one side must be supplied; the other side keeps its
      * current value. A pending gateway request is left alone: the owner
@@ -1281,7 +1346,7 @@ public class GatewayService {
         String ghV = null, ngV = null;
         if (gh != null && !gh.isBlank()) {
             // v160: restored the v148 fix (v152's stale base reverted it to
-            // AKWAPAY-only, so the SA toggle to AlphaPay/RushPay 400'd live).
+            // AKWAPAY-only, so the SA toggle to AlphaPay/CediLink 400'd live).
             // Validate against ALLOWED_GH like every other setter, via optGh.
             ghV = optGh(gh);
         }

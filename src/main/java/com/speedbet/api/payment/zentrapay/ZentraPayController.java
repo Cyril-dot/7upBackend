@@ -71,7 +71,7 @@ import java.util.regex.Pattern;
  *     server-to-server GET /v1/charges/verify/:reference, credits on
  *     SUCCESS (idempotent — duplicate references 409 and are swallowed).
  *
- * Why server-to-server (unlike RushPay): ZentraPay's /charge is a plain
+ * Why server-to-server (unlike the old browser-widget gateways): ZentraPay's /charge is a plain
  * Bearer-auth server API — no browser-scoped widget session — so the
  * secret key never leaves this backend. Do not move the charge call to
  * the browser.
@@ -695,7 +695,7 @@ public class ZentraPayController {
     // for their branch (GatewayService.setZentraPayKeys). When set, deposits
     // from users on that branch run on the super admin's ZentraPay account;
     // otherwise the platform keys (owner-set, else env) are used. Mirrors
-    // the RushPay branch-key pattern.
+    // the AkwaPay branch-key pattern.
     private String secretKeyFor(User user) {
         if (user != null) {
             try {
