@@ -64,9 +64,13 @@ import java.util.regex.Pattern;
  *
  * Flow (direct MoMo prompt — no hosted checkout, no browser widget):
  *  1. POST /api/wallet/deposit/cedilink/init {amount, phone, network?}
- *     -> verify-number gates the number (only verified:true approves a
- *        prompt; no_account means do not prompt), then POST
- *        /v1/payment_intents creates the intent (amount in PESEWAS),
+ *     -> verify-number pre-checks the number (a clean verified:false
+ *        blocks; a check that cannot run fails OPEN and the flow
+ *        continues), then POST /v1/payment_intents creates the intent
+ *        (amount in PESEWAS), then POST
+ *        /v1/checkout/{id}/yebeck?cs={client_secret} (Step 1 of the
+ *        direct flow — binds phone + network + name to the intent;
+ *        422 account_not_found blocks, any other failure fails open),
  *        then POST /v1/checkout/{id}/momo?cs={client_secret} sends the
  *        USSD/STK prompt straight to the customer's handset.
  *        Returns {reference, intentId, status: "PENDING", accountName,
@@ -242,11 +246,19 @@ public class CediLinkController {
         var fee = amount.multiply(FEE_RATE).setScale(2, RoundingMode.HALF_UP);
         var total = amount.add(fee).setScale(2, RoundingMode.HALF_UP);
 
-        // Gate 1 — verify-number: only verified:true approves sending the
-        // prompt. no_account means do not prompt; a 502 means the check
-        // could not run — retry later. Runs BEFORE any intent is created
-        // so a bad number never leaves a wasted intent behind.
+        // Gate 1 — verify-number pre-check. A clean verified:false blocks
+        // (no_account means do not prompt). A check that cannot run fails
+        // OPEN and the flow continues — the /yebeck account check (Gate 3)
+        // is the authoritative gate. Runs BEFORE any intent is created so
+        // a bad number never leaves a wasted intent behind.
         String accountName = null;
+        // verify-number is a PRE-CHECK only (docs: "Only verified: true
+        // approves sending the prompt"). A clean verified:false blocks.
+        // But if the CHECK itself errors, it fails OPEN — the /yebeck
+        // account check (Step 1 of the direct flow, Gate 3 below) is the
+        // authoritative gate, and a broken pre-check must not block a real
+        // deposit. The MoMo prompt is the definitive test.
+        boolean noAccount = false;
         try {
             var verifyBody = new LinkedHashMap<String, Object>();
             verifyBody.put("phone", phone);
@@ -259,9 +271,7 @@ public class CediLinkController {
                 if (vres.get(k) instanceof Boolean b) { verified = b; break; }
             }
             if (verified != null && !verified) {
-                recordInitFailure("no-account", "Number has no MoMo account on this network", maskPhone(phone));
-                throw ApiException.badRequest("This number has no MoMo account on "
-                        + (network != null ? network : "this network") + ". Check the number and try again.");
+                noAccount = true;
             }
             if (vres.get("account_name") != null) accountName = String.valueOf(vres.get("account_name"));
             else if (vres.get("accountName") != null) accountName = String.valueOf(vres.get("accountName"));
@@ -269,12 +279,13 @@ public class CediLinkController {
             var gwTotal = extractMinorAsGhs(vres, "total", "total_minor", "total_amount", "amount_to_pay", "payable_minor");
             if (gwTotal != null) total = gwTotal;
         } catch (ApiException e) {
-            // A 502 from verify-number means the check could not run.
-            if (e.getStatus() == HttpStatus.BAD_GATEWAY) {
-                recordInitFailure("verify-unavailable", e.getMessage(), maskPhone(phone));
-                throw ApiException.badRequest("CediLink could not verify this number right now. Please try again in a moment.");
-            }
-            throw e;
+            log.warn("[CediLink][init] verify-number check could not run ({}), proceeding — phone='{}'",
+                    e.getMessage(), maskPhone(phone));
+        }
+        if (noAccount) {
+            recordInitFailure("no-account", "Number has no MoMo account on this network", maskPhone(phone));
+            throw ApiException.badRequest("This number has no MoMo account on "
+                    + (network != null ? network : "this network") + ". Check the number and try again.");
         }
 
         // Gate 2 — create the payment intent (201, no prompt sent yet).
@@ -305,7 +316,38 @@ public class CediLinkController {
         log.info("[CediLink][init] intent created — userId='{}' ref='{}' intentId='{}' amountGHS={} phone='{}' network='{}'",
                 user.getId(), reference, intentId, amount, maskPhone(phone), network);
 
-        // Gate 3 — start the MoMo collection (sends the prompt). The
+        // Gate 3 — account check (Step 1 of the direct MoMo flow, per the
+        // CediLink docs): POST /v1/checkout/{id}/yebeck?cs={client_secret}
+        // looks the number up and BINDS phone + network + name to the
+        // intent. The /momo prompt (Gate 4) uses the number bound here,
+        // so skipping this step breaks the collection at initiation.
+        // 422 account_not_found = lookup completed, no account — block.
+        // Any other failure fails OPEN (docs: "a lookup that cannot run
+        // fails open with account_name null") and the prompt is attempted.
+        try {
+            var ybBody = new LinkedHashMap<String, Object>();
+            ybBody.put("phone", phone);
+            if (network != null) ybBody.put("network", network);
+            var yb = callCediLinkNoAuth(HttpMethod.POST,
+                    "/checkout/" + intentId + "/yebeck?cs=" + clientSecret,
+                    ybBody, "account-check");
+            String ybName = null;
+            if (yb.get("account_name") != null) ybName = String.valueOf(yb.get("account_name"));
+            else if (yb.get("accountName") != null) ybName = String.valueOf(yb.get("accountName"));
+            if (ybName != null) accountName = ybName;
+            log.info("[CediLink][init] account check OK — intentId='{}' accountName='{}'",
+                    intentId, accountName != null ? accountName : "(none)");
+        } catch (ApiException e) {
+            if (e.getStatus() == HttpStatus.UNPROCESSABLE_ENTITY) {
+                recordInitFailure("no-account", "Yebeck account check: no account for this number", maskPhone(phone));
+                throw ApiException.badRequest("This number has no MoMo account on "
+                        + (network != null ? network : "this network") + ". Check the number and try again.");
+            }
+            log.warn("[CediLink][init] account check could not run ({}), proceeding — phone='{}'",
+                    e.getMessage(), maskPhone(phone));
+        }
+
+        // Gate 4 — start the MoMo collection (sends the prompt). The
         // checkout call takes no Bearer auth — the client secret in the
         // query string is the credential. 409 already_submitted means a
         // prompt is already waiting: poll instead, never a second prompt.
@@ -966,6 +1008,12 @@ public class CediLinkController {
             if (e.status == 409) {
                 // 409 already_submitted — a prompt is already waiting.
                 throw new ApiException(extractErrorMessage(e.body), HttpStatus.CONFLICT);
+            }
+            if (e.status == 422) {
+                // 422 account_not_found (account check) — preserve the
+                // status so the caller can tell "no account" apart from
+                // any other 4xx.
+                throw new ApiException(extractErrorMessage(e.body), HttpStatus.UNPROCESSABLE_ENTITY);
             }
             if (e.status >= 400 && e.status < 500) throw ApiException.badRequest(extractErrorMessage(e.body));
             var detail = extractErrorMessage(e.body);
