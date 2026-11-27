@@ -62,12 +62,14 @@ import java.util.regex.Pattern;
  * platform/general Ghana gateway (v215); the site owner sets the platform
  * CediLink keys and a super admin can set their own branch keys.
  *
- * Flow (direct MoMo prompt — no hosted checkout, no browser widget):
+ * Flow (direct MoMo push — no hosted checkout, no browser widget — per
+ * the CediLink Integration Guide, 27 Nov 2026, live commit f376d2f,
+ * the authoritative spec; it supersedes the Postman collection):
  *  1. POST /api/wallet/deposit/cedilink/init {amount, phone, network?}
- *     -> verify-number pre-checks the number (a clean verified:false
- *        blocks; a check that cannot run fails OPEN and the flow
- *        continues), then POST /v1/payment_intents creates the intent
- *        (amount in PESEWAS), then POST
+ *     -> POST /v1/payment_intents creates the intent (amount in
+ *        PESEWAS). Create runs the account check itself (Guide §5.1):
+ *        a definitive "no account" answers 402 account_not_found; an
+ *        unavailable checker fails open. Then POST
  *        /v1/checkout/{id}/yebeck?cs={client_secret} (Step 1 of the
  *        direct flow — binds phone + network + name to the intent;
  *        422 account_not_found blocks, any other failure fails open),
@@ -76,6 +78,8 @@ import java.util.regex.Pattern;
  *        Returns {reference, intentId, status: "PENDING", accountName,
  *        total, fee}. The reference is OURS (DEP_<userId>_<random>) so
  *        the userId is recoverable from every later call and webhook.
+ *        NOTE: /v1/verify-number is NOT called per payment (Guide §7 —
+ *        opt-in, never gates the prompt, do not verify every payment).
  *  2. Customer approves on the phone with their MoMo PIN; CediLink POSTs
  *     the success event to /api/webhooks/cedilink.
  *  3. GET  /api/wallet/deposit/cedilink/status?ref=...&intentId=... ->
@@ -101,9 +105,13 @@ import java.util.regex.Pattern;
  *    inspect another user's deposit.
  *
  * Money rule: the wallet is credited the FULL requested amount; the
- * customer pays amount + 2% (CediLink's fee, on top). The verify-number
- * response carries the total the customer will pay; the credit uses the
- * intent amount (minor units / 100).
+ * customer pays amount + 2% (CediLink's fee, on top). The total the
+ * customer pays is the requested amount + 2% (computed here, shown in
+ * the pre-payment modal); the credit uses the requested amount.
+ * NOTE (Guide §4): CediLink settles requested MINUS 1% to the merchant
+ * (GH₵100 requested → GH₵99 to 7UP's balance), so crediting the full
+ * GH₵100 costs the house GH₵1 per GH₵100 — kept as-is per the v215
+ * "wallet credited FULL" decision; revisit only on the owner's word.
  */
 @Slf4j
 @RestController
@@ -203,7 +211,7 @@ public class CediLinkController {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Step 1 — Direct MoMo intent + prompt (verify-number gate first)
+    // Step 1 — Direct MoMo intent + prompt (create → /yebeck → /momo)
     // Body: { "amount": 50, "phone": "0241234567", "network": "MTN" (optional) }
     // ═══════════════════════════════════════════════════════════════════════════
     @PostMapping("/api/wallet/deposit/cedilink/init")
@@ -246,49 +254,16 @@ public class CediLinkController {
         var fee = amount.multiply(FEE_RATE).setScale(2, RoundingMode.HALF_UP);
         var total = amount.add(fee).setScale(2, RoundingMode.HALF_UP);
 
-        // Gate 1 — verify-number pre-check. A clean verified:false blocks
-        // (no_account means do not prompt). A check that cannot run fails
-        // OPEN and the flow continues — the /yebeck account check (Gate 3)
-        // is the authoritative gate. Runs BEFORE any intent is created so
-        // a bad number never leaves a wasted intent behind.
+        // No verify-number call here (Guide §7): it is opt-in, never
+        // gates the prompt endpoint, and must not run on every
+        // payment. Verification is handled by create's built-in
+        // account check (Gate 1, §5.1) and the /yebeck account
+        // check (Gate 2, §6.2). The MoMo prompt is the final check.
         String accountName = null;
-        // verify-number is a PRE-CHECK only (docs: "Only verified: true
-        // approves sending the prompt"). A clean verified:false blocks.
-        // But if the CHECK itself errors, it fails OPEN — the /yebeck
-        // account check (Step 1 of the direct flow, Gate 3 below) is the
-        // authoritative gate, and a broken pre-check must not block a real
-        // deposit. The MoMo prompt is the definitive test.
-        boolean noAccount = false;
-        try {
-            var verifyBody = new LinkedHashMap<String, Object>();
-            verifyBody.put("phone", phone);
-            if (network != null) verifyBody.put("network", network);
-            verifyBody.put("amount_minor", amountMinor);
-            verifyBody.put("currency", "GHS");
-            var vres = callCediLink(HttpMethod.POST, "/verify-number", verifyBody, true, "verify-number", key, null);
-            Boolean verified = null;
-            for (var k : new String[]{"verified", "is_verified", "valid", "is_valid"}) {
-                if (vres.get(k) instanceof Boolean b) { verified = b; break; }
-            }
-            if (verified != null && !verified) {
-                noAccount = true;
-            }
-            if (vres.get("account_name") != null) accountName = String.valueOf(vres.get("account_name"));
-            else if (vres.get("accountName") != null) accountName = String.valueOf(vres.get("accountName"));
-            // Prefer the gateway's own total when it returns one.
-            var gwTotal = extractMinorAsGhs(vres, "total", "total_minor", "total_amount", "amount_to_pay", "payable_minor");
-            if (gwTotal != null) total = gwTotal;
-        } catch (ApiException e) {
-            log.warn("[CediLink][init] verify-number check could not run ({}), proceeding — phone='{}'",
-                    e.getMessage(), maskPhone(phone));
-        }
-        if (noAccount) {
-            recordInitFailure("no-account", "Number has no MoMo account on this network", maskPhone(phone));
-            throw ApiException.badRequest("This number has no MoMo account on "
-                    + (network != null ? network : "this network") + ". Check the number and try again.");
-        }
 
-        // Gate 2 — create the payment intent (201, no prompt sent yet).
+        // Gate 1 — create the payment intent (201, no prompt sent yet). Create
+        // runs the account check itself (Guide §5.1): a definitive "no account"
+        // answers 402 account_not_found; an unavailable checker fails open.
         var intentBody = new LinkedHashMap<String, Object>();
         intentBody.put("amount", amountMinor);
         intentBody.put("currency", "GHS");
@@ -303,7 +278,11 @@ public class CediLinkController {
         try {
             created = callCediLink(HttpMethod.POST, "/payment_intents", intentBody, true, "create-intent", key, reference);
         } catch (ApiException e) {
-            if (e.getStatus().value() >= 500)
+            // Create runs the account check itself (Guide §5.1): a 402 here is
+            // account_not_found — a definitive "no account".
+            if (e.getStatus() == HttpStatus.PAYMENT_REQUIRED)
+                recordInitFailure("no-account", e.getMessage(), maskPhone(phone));
+            else if (e.getStatus().value() >= 500)
                 recordInitFailure("upstream", e.getMessage(), maskPhone(phone));
             throw e;
         }
@@ -316,10 +295,10 @@ public class CediLinkController {
         log.info("[CediLink][init] intent created — userId='{}' ref='{}' intentId='{}' amountGHS={} phone='{}' network='{}'",
                 user.getId(), reference, intentId, amount, maskPhone(phone), network);
 
-        // Gate 3 — account check (Step 1 of the direct MoMo flow, per the
+        // Gate 2 — account check (Step 1 of the direct MoMo flow, per the
         // CediLink docs): POST /v1/checkout/{id}/yebeck?cs={client_secret}
         // looks the number up and BINDS phone + network + name to the
-        // intent. The /momo prompt (Gate 4) uses the number bound here,
+        // intent. The /momo prompt (Gate 3) uses the number bound here,
         // so skipping this step breaks the collection at initiation.
         // 422 account_not_found = lookup completed, no account — block.
         // Any other failure fails OPEN (docs: "a lookup that cannot run
@@ -347,7 +326,7 @@ public class CediLinkController {
                     e.getMessage(), maskPhone(phone));
         }
 
-        // Gate 4 — start the MoMo collection (sends the prompt). The
+        // Gate 3 — start the MoMo collection (sends the prompt). The
         // checkout call takes no Bearer auth — the client secret in the
         // query string is the credential. 409 already_submitted means a
         // prompt is already waiting: poll instead, never a second prompt.
@@ -1005,6 +984,13 @@ public class CediLinkController {
         try {
             result = (Map<String, Object>) mono.block();
         } catch (UpstreamException e) {
+            if (e.status == 402) {
+                // 402 payment_failed (provider refused the initiation) —
+                // preserve the status like callCediLink does, so the
+                // caller can tell a provider refusal apart from a
+                // validation error.
+                throw new ApiException(extractErrorMessage(e.body), HttpStatus.PAYMENT_REQUIRED);
+            }
             if (e.status == 409) {
                 // 409 already_submitted — a prompt is already waiting.
                 throw new ApiException(extractErrorMessage(e.body), HttpStatus.CONFLICT);
@@ -1028,15 +1014,20 @@ public class CediLinkController {
         return result;
     }
 
-    /** CediLink errors look like { "error": { "message": "..." } } or { "message": "..." }. */
+    /** CediLink errors look like { "error": { "code": "...", "message": "..." } }
+     *  (Integration Guide §12). The code is kept in the returned message
+     *  ("code: message") so a failure names itself in the frontend error
+     *  and in the SA diagnostics — the message alone is often vague. */
     @SuppressWarnings("unchecked")
     private String extractErrorMessage(String rawBody) {
         try {
             var parsed = (Map<String, Object>) objectMapper.readValue(rawBody, Map.class);
             if (parsed.get("error") instanceof Map<?, ?> em) {
-                var m = ((Map<String, Object>) em).get("message");
+                var emMap = (Map<String, Object>) em;
+                var m = emMap.get("message");
+                var code = emMap.get("code");
+                if (m != null && code != null) return code + ": " + m;
                 if (m != null) return m.toString();
-                var code = ((Map<String, Object>) em).get("code");
                 if (code != null) return code.toString();
             }
             if (parsed.get("message") != null) return parsed.get("message").toString();
@@ -1046,7 +1037,7 @@ public class CediLinkController {
         return "Payment request was rejected.";
     }
 
-    // ─── Response-shape helpers (defensive: the collection gives no samples) ─
+    // ─── Response-shape helpers (defensive: shapes per the Integration Guide §5/§6/§11) ─
 
     /** The intent's amount is in minor units (pesewas) — convert to GHS. */
     @SuppressWarnings("unchecked")
@@ -1062,24 +1053,6 @@ public class CediLinkController {
         } catch (Exception e) {
             return null;
         }
-    }
-
-    /** Read a minor-units total from a verify-number response under any of the given keys. */
-    @SuppressWarnings("unchecked")
-    private BigDecimal extractMinorAsGhs(Map<String, Object> response, String... keys) {
-        for (var k : keys) {
-            Object raw = response.get(k);
-            if (raw == null && response.get("data") instanceof Map<?, ?> dm) {
-                raw = ((Map<String, Object>) dm).get(k);
-            }
-            if (raw != null) {
-                try {
-                    return new BigDecimal(String.valueOf(raw))
-                            .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
-                } catch (Exception ignored) { }
-            }
-        }
-        return null;
     }
 
     /** Our DEP_ reference, as stored on the CediLink intent. */
