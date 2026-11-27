@@ -128,11 +128,18 @@ public class CediLinkController {
     // CediLink takes 2% from the customer on top of the requested amount.
     private static final BigDecimal FEE_RATE = new BigDecimal("0.02");
 
-    private static final Duration TIMEOUT = Duration.ofSeconds(15);
+    // Init calls (create, /yebeck, /momo) get 30s each. CediLink's own API
+    // answers in ~1s, but create runs a Yebeck account check and /yebeck
+    // + /momo talk to Yebeck, and a slow Yebeck lookup blows past 15s —
+    // the 15s timeout copied from the ZentraPay pattern was too short
+    // for CediLink and killed real deposits ("did not answer in time").
+    // 30s gives Yebeck room; the calls are sequential and dependent, so
+    // they cannot be parallelised.
+    private static final Duration TIMEOUT = Duration.ofSeconds(30);
     // Verify (status check) gets a short timeout so a slow CediLink verify
     // fails fast instead of blocking the poll. The frontend poll IS the
     // retry — it re-checks almost immediately. The init POST keeps the
-    // full 15s and is never retried.
+    // full 30s and is never retried.
     private static final Duration VERIFY_TIMEOUT = Duration.ofSeconds(2);
 
     private final WalletService    walletService;
