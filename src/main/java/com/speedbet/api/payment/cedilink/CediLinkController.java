@@ -271,7 +271,13 @@ public class CediLinkController {
         if (network != null) intentBody.put("network", network);
         intentBody.put("customer", Map.of("phone", phone, "email", CHARGE_EMAIL));
         intentBody.put("reference", reference);
-        intentBody.put("description", "7UP deposit " + reference);
+        // Narration: Yebeck caps the MoMo narration at 50 characters
+        // (incl. spaces) — the old "7UP deposit <DEP_...>" description
+        // was 64 chars and Yebeck refused the collection at initiation
+        // ("Maximum length for narration is 50 characters"). Keep it a
+        // short fixed label; the reference (not the narration) carries
+        // the userId for the webhook.
+        intentBody.put("description", "7UP BET deposit");
         intentBody.put("metadata", Map.of("user_id", user.getId().toString(), "reference", reference));
 
         Map<String, Object> created;
