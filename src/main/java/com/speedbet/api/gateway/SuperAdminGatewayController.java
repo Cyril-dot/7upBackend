@@ -48,7 +48,7 @@ public class SuperAdminGatewayController {
         out.put("active", active);
         out.put("ghanaKeys", gatewayService.ghanaKeyStatus(actor.getId()));
         out.put("alphaPayKeys", gatewayService.alphaPayKeyStatus(actor.getId()));
-        out.put("rushPayKeys", gatewayService.rushPayKeyStatus(actor.getId()));
+        out.put("cediLinkKeys", gatewayService.cediLinkKeyStatus(actor.getId()));
         out.put("zentraPayKeys", gatewayService.zentraPayKeyStatus(actor.getId()));
         out.put("depositsEnabled", gatewayService.depositsEnabledFor(actor));
         out.put("pendingRequest", pending);
@@ -125,27 +125,6 @@ public class SuperAdminGatewayController {
                         : "Your own AlphaPay key was saved. Ghana deposits on your branch now run on your AlphaPay account."));
     }
 
-    /**
-     * Direct set of the branch's OWN RushPay credentials for Ghana
-     * deposits. Blank fields keep their current value; clear=true wipes
-     * both halves back to the platform keys. Values are stored encrypted
-     * and never returned — the response carries set/unset + last4 only.
-     * RushPay needs both halves (API key + webhook secret) together.
-     */
-    @PutMapping("/rushpay-keys")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> setRushPayKeys(
-            @AuthenticationPrincipal User actor,
-            @RequestBody Map<String, Object> req) {
-        requireSuperAdmin(actor);
-        boolean clear = Boolean.TRUE.equals(req.get("clear"));
-        var saved = gatewayService.setRushPayKeys(actor,
-                req.get("apiKey") == null ? null : req.get("apiKey").toString(),
-                req.get("webhookSecret") == null ? null : req.get("webhookSecret").toString(),
-                clear);
-        return ResponseEntity.ok(ApiResponse.ok(saved,
-                clear ? "Your own RushPay keys were removed. Ghana deposits on your branch now use the platform keys."
-                        : "Your own RushPay keys were saved. Ghana deposits on your branch now run on your RushPay account."));
-    }
 
     /**
      * Direct set of the branch's OWN ZentraPay credentials for Ghana
@@ -167,6 +146,28 @@ public class SuperAdminGatewayController {
         return ResponseEntity.ok(ApiResponse.ok(saved,
                 clear ? "Your own ZentraPay keys were removed. Ghana deposits on your branch now use the platform keys."
                         : "Your own ZentraPay keys were saved. Ghana deposits on your branch now run on your ZentraPay account."));
+    }
+
+    /**
+     * Direct set of the branch's OWN CediLink credentials for Ghana
+     * deposits. Blank fields keep their current value; clear=true wipes
+     * both halves back to the platform keys. Values are stored encrypted
+     * and never returned — the response carries set/unset + last4 only.
+     * CediLink needs both halves (secret key + webhook secret) together.
+     */
+    @PutMapping("/cedilink-keys")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setCediLinkKeys(
+            @AuthenticationPrincipal User actor,
+            @RequestBody Map<String, Object> req) {
+        requireSuperAdmin(actor);
+        boolean clear = Boolean.TRUE.equals(req.get("clear"));
+        var saved = gatewayService.setCediLinkKeys(actor,
+                req.get("secretKey") == null ? null : req.get("secretKey").toString(),
+                req.get("webhookSecret") == null ? null : req.get("webhookSecret").toString(),
+                clear);
+        return ResponseEntity.ok(ApiResponse.ok(saved,
+                clear ? "Your own CediLink keys were removed. Ghana deposits on your branch now use the platform keys."
+                        : "Your own CediLink keys were saved. Ghana deposits on your branch now run on your CediLink account."));
     }
 
     /**

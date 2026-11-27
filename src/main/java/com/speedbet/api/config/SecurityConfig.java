@@ -166,10 +166,10 @@ public class SecurityConfig {
                         // NOTE: /api/webhooks/** covers /api/webhooks/moolre automatically.
                         //       Moolre webhook identity is verified internally via the secret
                         //       field in the payload (see MoolreController.verifyWebhookSecret).
-                        //       It ALSO covers /api/webhooks/rushpay — RushPay webhook identity
+                        //       It ALSO covers /api/webhooks/cedilink — CediLink webhook identity
                         //       is verified internally via HMAC signature over the raw body
-                        //       (see RushPayController.verifySignature). Signature auth is why
-                        //       this path is permitAll: RushPay's servers have no JWT.
+                        //       (see CediLinkController.verifySignature). Signature auth is why
+                        //       this path is permitAll: CediLink's servers have no JWT.
                         .requestMatchers(HttpMethod.GET,  "/api/tip/**").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/webhooks/**").permitAll()
                         // GET /api/webhooks/alphapay is the BROWSER return after an
@@ -223,19 +223,6 @@ public class SecurityConfig {
                                 "/api/user/upgrade-to-admin/moolre/ussd/init"
                         ).authenticated()
 
-                        // ── RushPay — deposit + admin upgrade init (authenticated) ────────
-                        // These mint a checkout + short-lived widget session under the
-                        // logged-in user; the browser then drives MoMo/card/gift-card funding
-                        // with the widget token. The webhook (POST /api/webhooks/rushpay) is
-                        // covered by the /api/webhooks/** permitAll rule above and is
-                        // authenticated by HMAC signature, not JWT.
-                        // POST /api/wallet/deposit/rushpay/init          — creates deposit checkout
-                        // POST /api/user/upgrade-to-admin/rushpay/init   — pays GHS 200 upgrade fee
-                        .requestMatchers(HttpMethod.POST,
-                                "/api/wallet/deposit/rushpay/init",
-                                "/api/user/upgrade-to-admin/rushpay/init"
-                        ).authenticated()
-
                         // ── Web Rabbit — Ghana Mobile Money deposit (authenticated) ─────
                         // The webhook is covered by /api/webhooks/** above and uses HMAC.
                         .requestMatchers(HttpMethod.POST,
@@ -259,7 +246,7 @@ public class SecurityConfig {
 // card/bank mint a hosted checkout session and return checkout_url.
 // The callback (POST /api/webhooks/nalopay/{token}) is covered by the
 // /api/webhooks/** permitAll rule above. NALOPAY does NOT sign callbacks —
-// unlike RushPay's HMAC — so identity is proven by a shared secret in the
+// unlike the HMAC gateways — so identity is proven by a shared secret in the
 // URL path, compared in constant time (NaloPayController.callback).
                                 .requestMatchers(HttpMethod.POST,
                                         "/api/wallet/deposit/nalopay-momo/init",

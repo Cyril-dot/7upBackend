@@ -34,7 +34,7 @@ public class BranchGatewaySetting {
     @Column(name = "super_admin_id", nullable = false, unique = true)
     private UUID superAdminId;
 
-    /** Ghana deposit gateway. Allowed: AKWAPAY, GMP, ALPHAPAY, RUSHPAY, ZENTRAPAY. */
+    /** Ghana deposit gateway. Allowed: AKWAPAY, GMP, ALPHAPAY, CEDILINK, ZENTRAPAY. */
     @Column(name = "gh_gateway", nullable = false, length = 30)
     @Builder.Default
     private String ghGateway = "AKWAPAY";
@@ -124,27 +124,6 @@ public class BranchGatewaySetting {
     @Column(name = "gh_alphapay_secret_key_last4", length = 10)
     private String ghAlphapaySecretKeyLast4;
 
-    // ── Ghana: this branch's OWN RushPay credentials (optional) ─────────
-    // Encrypted with GatewaySecretCrypto (server env GATEWAY_KEY_SECRET).
-    // When set, Ghana deposits from users on this branch run on the super
-    // admin's own RushPay merchant account instead of the platform keys.
-    // RushPay needs BOTH halves: the API key (X-API-Key) creates checkouts
-    // and the webhook secret verifies settlement webhooks (HMAC) — a key
-    // without its webhook secret would create payments that can never
-    // settle by webhook. Blank = fall back to the platform keys. Only the
-    // last 4 of the API key are ever returned, never the values.
-    @Column(name = "gh_rushpay_api_key", length = 500)
-    private String ghRushpayApiKey;
-
-    @Column(name = "gh_rushpay_api_key_last4", length = 10)
-    private String ghRushpayApiKeyLast4;
-
-    @Column(name = "gh_rushpay_webhook_secret", length = 500)
-    private String ghRushpayWebhookSecret;
-
-    @Column(name = "gh_rushpay_webhook_secret_last4", length = 10)
-    private String ghRushpayWebhookSecretLast4;
-
     // ── Ghana: this branch's OWN ZentraPay credentials (optional) ─────────
     // Encrypted with GatewaySecretCrypto (server env GATEWAY_KEY_SECRET).
     // When set, Ghana deposits from users on this branch run on the super
@@ -166,6 +145,28 @@ public class BranchGatewaySetting {
 
     @Column(name = "gh_zentrapay_webhook_secret_last4", length = 10)
     private String ghZentrapayWebhookSecretLast4;
+
+    // ── Ghana: this branch's OWN CediLink credentials (optional) ─────────
+    // Encrypted with GatewaySecretCrypto (server env GATEWAY_KEY_SECRET).
+    // When set, Ghana deposits from users on this branch run on the super
+    // admin's own CediLink merchant account instead of the platform keys.
+    // CediLink needs BOTH halves: the secret key (Bearer auth) creates
+    // payment intents, and the webhook secret verifies settlement
+    // webhooks (HMAC) — a key without its webhook secret would create
+    // payments that can never settle by webhook. Blank = fall back to the
+    // platform keys. Only the last 4 of the secret key are ever returned,
+    // never the values.
+    @Column(name = "gh_cedilink_secret_key", length = 500)
+    private String ghCedilinkSecretKey;
+
+    @Column(name = "gh_cedilink_secret_key_last4", length = 10)
+    private String ghCedilinkSecretKeyLast4;
+
+    @Column(name = "gh_cedilink_webhook_secret", length = 500)
+    private String ghCedilinkWebhookSecret;
+
+    @Column(name = "gh_cedilink_webhook_secret_last4", length = 10)
+    private String ghCedilinkWebhookSecretLast4;
 
     // ── Branch deposits maintenance mode (v161) ──────────────────────────
     // Null = deposits enabled (the default). A super admin flips this from
