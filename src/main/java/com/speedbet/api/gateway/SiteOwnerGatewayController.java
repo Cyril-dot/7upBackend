@@ -62,8 +62,8 @@ public class SiteOwnerGatewayController {
             row.put("superAdminId", sa.getId().toString());
             row.put("superAdminEmail", sa.getEmail());
             row.put("status", sa.getStatus() == null ? null : sa.getStatus().name());
-            row.put("ghGateway", setting == null ? GatewayService.DEFAULT_GH : setting.getGhGateway());
-            row.put("ngGateway", setting == null ? GatewayService.DEFAULT_NG : setting.getNgGateway());
+            row.put("ghGateway", setting == null ? gatewayService.platformDefaultGh() : setting.getGhGateway());
+            row.put("ngGateway", setting == null ? gatewayService.platformDefaultNg() : setting.getNgGateway());
             row.put("isBranchDefault", setting == null);
             return row;
         }).toList();
@@ -78,6 +78,28 @@ public class SiteOwnerGatewayController {
         return ResponseEntity.ok(ApiResponse.ok(
                 gatewayService.setDirect(owner, saId, req.get("ghGateway"), req.get("ngGateway")),
                 "Branch gateways set. Any pending request for this branch was superseded."));
+    }
+
+    /** Current platform default gateways (the fallback for branches with no explicit setting). */
+    @GetMapping("/platform-default")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> platformDefault() {
+        return ResponseEntity.ok(ApiResponse.ok(gatewayService.platformDefault()));
+    }
+
+    /**
+     * Site owner sets the platform default gateways (v216).
+     * Body: {"ghGateway": "CEDILINK", "ngGateway": "GMP"} — either may be
+     * omitted (leave as-is). Branches with no explicit setting pick the
+     * new default up immediately; branches with their own setting are
+     * untouched, and an SA can still override their own branch.
+     */
+    @PutMapping("/platform-default")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setPlatformDefault(
+            @AuthenticationPrincipal User owner,
+            @RequestBody Map<String, String> req) {
+        return ResponseEntity.ok(ApiResponse.ok(
+                gatewayService.setPlatformDefault(owner, req.get("ghGateway"), req.get("ngGateway")),
+                "Platform default gateways set. Branches without their own setting now use them."));
     }
 
     /** Masked status of the platform (general) AlphaPay key. */
