@@ -60,6 +60,7 @@ public class GatewayService {
 
     private final BranchGatewaySettingRepository settingRepo;
     private final PlatformGatewayKeyRepository platformKeyRepo;
+    private final PlatformSettingRepository platformSettingRepo;
     private final GatewayRequestRepository requestRepo;
     private final UserRepository userRepo;
     private final ReferralLinkRepository linkRepo;
@@ -189,8 +190,8 @@ public class GatewayService {
         var out = new LinkedHashMap<String, Object>();
         out.put("branchSuperAdminId", saId.map(UUID::toString).orElse(null));
         if (saId.isEmpty()) {
-            out.put("ghGateway", DEFAULT_GH);
-            out.put("ngGateway", DEFAULT_NG);
+            out.put("ghGateway", platformDefaultGh());
+            out.put("ngGateway", platformDefaultNg());
             out.put("ngManualBank", null);
             out.put("ghManualMomo", null);
             out.put("isBranchDefault", true);
@@ -200,14 +201,74 @@ public class GatewayService {
         // v215: a stored gateway that is no longer allowed (e.g. RUSHPAY,
         // removed) falls back to the platform default instead of returning
         // a dead gateway the frontend cannot render.
-        String gh = setting == null ? DEFAULT_GH : setting.getGhGateway();
-        if (!ALLOWED_GH.contains(gh)) gh = DEFAULT_GH;
+        String gh = setting == null ? platformDefaultGh() : setting.getGhGateway();
+        if (!ALLOWED_GH.contains(gh)) gh = platformDefaultGh();
         out.put("ghGateway", gh);
-        out.put("ngGateway", setting == null ? DEFAULT_NG : setting.getNgGateway());
+        out.put("ngGateway", setting == null ? platformDefaultNg() : setting.getNgGateway());
         out.put("ngManualBank", ngManualBankRow(setting));
         out.put("ghManualMomo", ghManualMomoEnabled(setting) ? ghManualMomoRow(setting) : null);
         out.put("isBranchDefault", setting == null);
         return out;
+    }
+
+    // ─── Platform default gateways (v216, site-owner set) ──────────────
+
+    /**
+     * The platform default Ghana gateway, as set by the site owner in the
+     * app — falls back to DEFAULT_GH (CEDILINK) when unset or invalid.
+     * This is the gateway a branch falls back to when it has no explicit
+     * setting, and the fallback for a stored gateway that is no longer
+     * allowed.
+     */
+    public String platformDefaultGh() {
+        var row = platformSettingRepo.findById(PlatformSetting.SINGLETON_ID).orElse(null);
+        var v = row == null ? null : row.getDefaultGhGateway();
+        if (v == null || v.isBlank()) return DEFAULT_GH;
+        v = v.trim().toUpperCase();
+        return ALLOWED_GH.contains(v) ? v : DEFAULT_GH;
+    }
+
+    /** The platform default Nigeria gateway — falls back to DEFAULT_NG (GMP) when unset or invalid. */
+    public String platformDefaultNg() {
+        var row = platformSettingRepo.findById(PlatformSetting.SINGLETON_ID).orElse(null);
+        var v = row == null ? null : row.getDefaultNgGateway();
+        if (v == null || v.isBlank()) return DEFAULT_NG;
+        v = v.trim().toUpperCase();
+        return ALLOWED_NG.contains(v) ? v : DEFAULT_NG;
+    }
+
+    /** Current platform defaults for the site-owner panel. */
+    public Map<String, Object> platformDefault() {
+        var out = new LinkedHashMap<String, Object>();
+        out.put("ghGateway", platformDefaultGh());
+        out.put("ngGateway", platformDefaultNg());
+        return out;
+    }
+
+    /**
+     * Site owner sets the platform default gateways. Either value may be
+     * omitted (null/blank = leave it as-is); at least one must be set.
+     * Validated against ALLOWED_GH / ALLOWED_NG like every other setter.
+     * Audit-logged with before/after.
+     */
+    @Transactional
+    public Map<String, Object> setPlatformDefault(User owner, String gh, String ng) {
+        var ghV = optGh(gh);
+        var ngV = optNg(ng);
+        if (ghV == null && ngV == null) {
+            throw ApiException.badRequest("Set at least one default gateway (ghGateway or ngGateway).");
+        }
+        var before = platformDefault();
+        var row = platformSettingRepo.findById(PlatformSetting.SINGLETON_ID)
+                .orElseGet(() -> PlatformSetting.builder().id(PlatformSetting.SINGLETON_ID).build());
+        if (ghV != null) row.setDefaultGhGateway(ghV);
+        if (ngV != null) row.setDefaultNgGateway(ngV);
+        row.setUpdatedAt(Instant.now());
+        platformSettingRepo.save(row);
+        var after = platformDefault();
+        auditService.log(owner.getId(), "SET_PLATFORM_DEFAULT_GATEWAY", "platform_settings",
+                PlatformSetting.SINGLETON_ID, before, after, null);
+        return after;
     }
 
     public Map<String, Object> settingRow(BranchGatewaySetting s) {
