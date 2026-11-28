@@ -149,6 +149,45 @@ public class ReferralService {
     }
 
     /**
+     * One-time referral-code set for an existing user (Account page, v217).
+     * The user types a code; on success they join that SA/admin's referral
+     * tree. Can only be done ONCE — a user who already has a referral (via
+     * registration or a previous set) gets a 409.
+     */
+    @Transactional
+    public ReferralLink setReferralForUser(UUID userId, String code, String email) {
+        String clean = code == null ? "" : code.trim().toUpperCase();
+        if (clean.isEmpty())
+            throw ApiException.badRequest("Enter a referral code.");
+        var user = userRepo.findById(userId).orElse(null);
+        if (user == null)
+            throw ApiException.notFound("User not found.");
+        if (user.getReferredViaLinkId() != null || referralRepo.findByUserId(userId).isPresent())
+            throw ApiException.conflict("Referral code already set. You can only set it once.");
+        ReferralResolution res = resolveRegistrationReferral(clean, email);
+        if (!res.refValid() || res.linkId() == null)
+            throw ApiException.badRequest("Referral code not recognised. Check the code and try again.");
+        ReferralLink link = linkRepo.findById(res.linkId()).orElse(null);
+        if (link == null)
+            throw ApiException.badRequest("Referral code not recognised. Check the code and try again.");
+        attributeUser(link.getId(), userId);
+        user.setReferredViaLinkId(link.getId());
+        userRepo.save(user);
+        log.info("setReferralForUser: userId={} joined linkId={} code={}", userId, link.getId(), clean);
+        return link;
+    }
+
+    /** The referral link a user is currently under, if any. */
+    @Transactional(readOnly = true)
+    public Optional<ReferralLink> findReferralLinkForUser(UUID userId) {
+        Optional<UUID> linkId = referralRepo.findByUserId(userId).map(Referral::getLinkId);
+        if (linkId.isEmpty()) {
+            linkId = userRepo.findById(userId).map(u -> u.getReferredViaLinkId());
+        }
+        return linkId.flatMap(linkRepo::findById);
+    }
+
+    /**
      * Attributes commission to the referring admin when a referred user deposits.
      *
      * ┌──────────────────────────────────────────────────────────────────────┐

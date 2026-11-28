@@ -3,6 +3,7 @@ package com.speedbet.api.gateway;
 import com.speedbet.api.audit.AuditService;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.referral.ReferralLinkRepository;
+import com.speedbet.api.referral.ReferralRepository;
 import com.speedbet.api.user.HierarchyService;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRepository;
@@ -64,6 +65,7 @@ public class GatewayService {
     private final GatewayRequestRepository requestRepo;
     private final UserRepository userRepo;
     private final ReferralLinkRepository linkRepo;
+    private final ReferralRepository referralRepo;
     private final HierarchyService hierarchy;
     private final AuditService auditService;
 
@@ -609,6 +611,21 @@ public class GatewayService {
     public void requireDepositsEnabled(User user) {
         if (!depositsEnabledFor(user))
             throw ApiException.badRequest("Deposits are under maintenance for your branch. Please try again later.");
+        requireReferralForDeposit(user);
+    }
+
+    /**
+     * v217: a regular player must be linked to a referral code before they
+     * can deposit. Admins / super admins / the site owner are exempt — they
+     * don't fall under another SA. A user with a Referral row OR a
+     * referredViaLinkId counts as linked.
+     */
+    public void requireReferralForDeposit(User user) {
+        if (user == null || user.getRole() != UserRole.USER) return;
+        boolean linked = user.getReferredViaLinkId() != null
+                || referralRepo.findByUserId(user.getId()).isPresent();
+        if (!linked)
+            throw ApiException.badRequest("Set your referral code in Account before you can deposit.");
     }
 
     @Transactional
