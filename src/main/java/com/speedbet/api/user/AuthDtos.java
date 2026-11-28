@@ -53,7 +53,8 @@ public class AuthDtos {
             String phone,
             String country,
             String role,
-            String themePreference
+            String themePreference,
+            boolean hasReferral
     ) {
         public static UserDto from(User u) {
             return new UserDto(
@@ -64,7 +65,8 @@ public class AuthDtos {
                     u.getPhone(),
                     u.getCountry(),
                     u.getRole().name(),
-                    u.getThemePreference()
+                    u.getThemePreference(),
+                    u.getReferredViaLinkId() != null
             );
         }
     }
